@@ -5,13 +5,14 @@ blunder-check mode that evaluates a move proposed on the board)."""
 from __future__ import annotations
 
 import chess
-from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QSettings, QThread, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
-    QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPushButton, QSlider, QStatusBar, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPushButton, QSlider, QStatusBar, QVBoxLayout, QWidget,
 )
 
-from .analysis_panel import AnalysisPanel
+from . import theme
+from .analysis_panel import AnalysisPanel, EvalBar
 from .board_widget import BoardWidget
 from .config import ASSETS_DIR
 from .fen_pipeline import FenFetchError, fetch_live_fen
@@ -41,11 +42,18 @@ class FetchWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ChessBuddy — chess.com FEN → Stockfish")
-        self.resize(1080, 880)
+        self.setWindowTitle("ChessBuddy")
+        self.resize(1180, 860)
+        self.setMinimumSize(980, 680)
         self._fetch_thread: QThread | None = None
         self._fetch_worker: FetchWorker | None = None
         self._build_ui()
+
+        # restore the saved theme (defaults to dark)
+        saved = QSettings().value("theme", "dark")
+        if saved in theme.PALETTES and saved != theme.current():
+            theme.apply(saved, QApplication.instance())
+        self._refresh_theme_btn()
 
         if not ASSETS_DIR.is_dir():
             self.statusBar().showMessage(
@@ -57,39 +65,55 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(10)
 
         # -- board first (referenced by the top bar) -------------------------
         self._board = BoardWidget(ASSETS_DIR)
 
-        # -- top bar: fetch / analyze / flip / opacity / pin ---------------
+        # -- top bar: fetch / analyze / flip | opacity / pin -----------------
         top = QHBoxLayout()
-        self._fetch_btn = QPushButton("⬇  Fetch FEN from browser")
+        top.setSpacing(8)
+        self._fetch_btn = QPushButton("⬇  Fetch position")
+        self._fetch_btn.setProperty("accent", True)
         self._fetch_btn.setToolTip(
             "Reads the live position from the active chess.com tab via WebBridge"
         )
         self._fetch_btn.clicked.connect(self._on_fetch_clicked)
         top.addWidget(self._fetch_btn)
 
-        self._analyze_btn = QPushButton("Analyze with Stockfish")
+        self._analyze_btn = QPushButton("⚡  Analyze")
         self._analyze_btn.setToolTip("1-second quick analysis, 3 lines")
         self._analyze_btn.clicked.connect(self._on_analyze)
         top.addWidget(self._analyze_btn)
 
-        self._flip_btn = QPushButton("⇅ Flip board")
+        self._flip_btn = QPushButton("⇅  Flip")
         self._flip_btn.setToolTip("Toggle White's / Black's point of view")
         self._flip_btn.clicked.connect(self._board.toggle_flip)
         top.addWidget(self._flip_btn)
+
+        self._theme_btn = QPushButton()
+        self._theme_btn.clicked.connect(self._on_theme_toggle)
+        top.addWidget(self._theme_btn)
         top.addStretch(1)
 
-        top.addWidget(QLabel("Opacity:"))
+        sep = QFrame()
+        sep.setObjectName("vSep")
+        sep.setFrameShape(QFrame.Shape.VLine)
+        top.addWidget(sep)
+
+        opacity_caption = QLabel("Opacity")
+        opacity_caption.setObjectName("muted")
+        top.addWidget(opacity_caption)
         self._opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self._opacity_slider.setRange(20, 100)
         self._opacity_slider.setValue(100)
-        self._opacity_slider.setFixedWidth(120)
+        self._opacity_slider.setFixedWidth(110)
         self._opacity_slider.valueChanged.connect(self._on_opacity)
         top.addWidget(self._opacity_slider)
         self._opacity_label = QLabel("100%")
+        self._opacity_label.setObjectName("muted")
+        self._opacity_label.setFixedWidth(36)
         top.addWidget(self._opacity_label)
 
         self._pin_check = QCheckBox("Always on top")
@@ -97,28 +121,47 @@ class MainWindow(QMainWindow):
         top.addWidget(self._pin_check)
         layout.addLayout(top)
 
-        # -- piece palette ---------------------------------------------------
-        self._palette = PiecePalette(self._board.renderer)
-        layout.addWidget(self._palette, 0, Qt.AlignmentFlag.AlignHCenter)
-
-        # -- board (left) + analysis panel (right) ---------------------------
+        # -- middle: palette | eval bar | board | analysis panel -------------
         middle = QHBoxLayout()
+        middle.setSpacing(10)
+
+        left = QVBoxLayout()
+        left.setSpacing(6)
+        caption = QLabel("PIECES")
+        caption.setObjectName("caption")
+        caption.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        left.addWidget(caption)
+        self._palette = PiecePalette(self._board.renderer)
+        left.addWidget(self._palette, 0, Qt.AlignmentFlag.AlignHCenter)
+        left.addStretch(1)
+        middle.addLayout(left, 0)
+
+        self._eval_bar = EvalBar(Qt.Orientation.Vertical)
+        middle.addWidget(self._eval_bar, 0)
+
         middle.addWidget(self._board, 1)
-        self._panel = AnalysisPanel(self._board)
+        self._panel = AnalysisPanel(self._board, eval_bar=self._eval_bar)
         middle.addWidget(self._panel, 0)
         layout.addLayout(middle, 1)
 
         # -- bottom: FEN + side-to-move --------------------------------------
         bottom = QHBoxLayout()
-        bottom.addWidget(QLabel("FEN:"))
+        bottom.setSpacing(8)
+        fen_caption = QLabel("FEN")
+        fen_caption.setObjectName("muted")
+        bottom.addWidget(fen_caption)
         self._fen_edit = QLineEdit(self._board.fen())
+        self._fen_edit.setObjectName("fenEdit")
         self._fen_edit.returnPressed.connect(self._on_apply_fen)
         bottom.addWidget(self._fen_edit, 1)
         self._apply_btn = QPushButton("Apply")
         self._apply_btn.clicked.connect(self._on_apply_fen)
         bottom.addWidget(self._apply_btn)
-        self._side_btn = QPushButton(_SIDE_LABEL[self._board.board.turn])
+        self._side_btn = QPushButton()
+        self._side_btn.setObjectName("sideChip")
+        self._side_btn.setToolTip("Click to switch the side to move")
         self._side_btn.clicked.connect(self._board.toggle_side_to_move)
+        self._refresh_side()
         bottom.addWidget(self._side_btn)
         layout.addLayout(bottom)
 
@@ -133,6 +176,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready — fetch a live position or edit the board", 6000)
 
     # ---------------------------------------------------------------- actions
+    def _refresh_side(self) -> None:
+        white = self._board.board.turn == chess.WHITE
+        self._side_btn.setText(_SIDE_LABEL[self._board.board.turn])
+        self._side_btn.setProperty("side", "w" if white else "b")
+        theme.repolish(self._side_btn)
+
     def _on_fetch_clicked(self) -> None:
         if self._fetch_thread is not None:
             return
@@ -164,7 +213,7 @@ class MainWindow(QMainWindow):
             self._on_fetch_err(f"Invalid FEN from browser: {exc}")
             return
         self._fen_edit.setText(fen)
-        self._side_btn.setText(_SIDE_LABEL[self._board.board.turn])
+        self._refresh_side()
         self._panel.on_position_changed()
 
         parts = []
@@ -216,9 +265,27 @@ class MainWindow(QMainWindow):
         self.setWindowFlags(flags)
         self.show()
 
+    def _refresh_theme_btn(self) -> None:
+        """The button shows the theme you switch *to* by clicking it."""
+        if theme.current() == "dark":
+            self._theme_btn.setText("☀  Light")
+            self._theme_btn.setToolTip("Switch to the light theme")
+        else:
+            self._theme_btn.setText("🌙  Dark")
+            self._theme_btn.setToolTip("Switch to the dark theme")
+
+    def _on_theme_toggle(self) -> None:
+        new = "light" if theme.current() == "dark" else "dark"
+        theme.apply(new, QApplication.instance())
+        QSettings().setValue("theme", new)
+        self._refresh_theme_btn()
+        # painted widgets read the palette at paint time; force a repaint
+        self._board.update()
+        self._eval_bar.update()
+
     def _on_board_edited(self, fen: str) -> None:
         self._fen_edit.setText(fen)
-        self._side_btn.setText(_SIDE_LABEL[self._board.board.turn])
+        self._refresh_side()
         self._panel.on_position_changed()
 
     def _on_apply_fen(self) -> None:
@@ -230,7 +297,7 @@ class MainWindow(QMainWindow):
             self._fen_edit.setStyleSheet("border: 1px solid #d9534f;")
             return
         self._fen_edit.setStyleSheet("")
-        self._side_btn.setText(_SIDE_LABEL[self._board.board.turn])
+        self._refresh_side()
         self._panel.on_position_changed()
         self.statusBar().showMessage("Position applied", 4000)
 

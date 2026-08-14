@@ -1,6 +1,9 @@
 """Piece palette: 12 buttons (6 piece types x 2 colours) used to place or
 replace pieces on the board after a fetch.
 
+Laid out as a vertical strip beside the board: one row per piece type,
+white in the left column, black in the right column.
+
 Click a button to "arm" that piece (the button stays checked). Clicking a
 square on the board then places it. Click again, right-click on the board or
 press Esc to disarm.
@@ -31,17 +34,18 @@ class PiecePalette(QWidget):
 
         layout = QGridLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(5)
         icon_size = 34
 
-        for row, color in enumerate((chess.WHITE, chess.BLACK)):
-            for col, ptype in enumerate(_TYPES):
+        for row, ptype in enumerate(_TYPES):
+            for col, color in enumerate((chess.WHITE, chess.BLACK)):
                 piece = chess.Piece(ptype, color)
                 btn = QPushButton(QIcon(self._renderer.pixmap(piece, icon_size)), "")
+                btn.setObjectName("paletteBtn")
                 btn.setCheckable(True)
                 btn.setToolTip(f"{'White' if color == chess.WHITE else 'Black'} {_LABELS[ptype]}")
-                btn.setFixedSize(icon_size + 10, icon_size + 10)
-                btn.setIconSize(QSize(int((icon_size + 10) * 0.72), int((icon_size + 10) * 0.72)))
+                btn.setFixedSize(icon_size + 12, icon_size + 12)
+                btn.setIconSize(QSize(icon_size, icon_size))
                 self._group.addButton(btn)
                 layout.addWidget(btn, row, col)
                 self._buttons[(color, ptype)] = btn

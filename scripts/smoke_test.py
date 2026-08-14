@@ -65,6 +65,10 @@ def main() -> int:
         panel._thread.wait(15000)
     app.processEvents()
     print("panel lines:", panel._list.count(), "| status:", panel._status_label.text())
+    print("board overlays:", [(f, t, n) for f, t, n in board._move_overlays])
+    assert len(board._move_overlays) == panel._list.count(), (
+        board._move_overlays, panel._list.count()
+    )
     panel.shutdown()
 
     # 5b. board flip round-trip

@@ -19,14 +19,23 @@ Extra modes
   replaying an engine line on the board).
 * ``set_last_move``                   -> highlight the from/to squares of the
   most recent move (used by line playback).
+* ``set_move_overlays``               -> faint numbered arrows for candidate
+  moves (used by the analysis panel to draw each engine line's first move).
+* ``animate_move``                    -> slide the moving piece(s) to their
+  destination with an ease-out animation instead of teleporting (used by
+  line playback); ``stop_animation`` cancels an in-flight slide.
 """
 from __future__ import annotations
 
+import math
+import time
+
 import chess
-from PyQt6.QtCore import Qt, QRectF, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter
+from PyQt6.QtCore import QPointF, Qt, QRectF, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import QWidget
 
+from . import theme
 from .pieces import PieceRenderer
 
 LIGHT = QColor("#f0d9b5")
@@ -36,7 +45,13 @@ HOVER_HL = QColor(255, 255, 255, 46)
 DROP_HL = QColor(120, 220, 120, 190)         # valid target under the cursor
 CHECK_RED = QColor(232, 66, 66, 200)         # king in check
 LAST_MOVE_HL = QColor(205, 210, 106, 190)    # from/to squares of last move
-COORD_COLOR = QColor(0, 0, 0, 110)
+
+# faint numbered arrows for the engine's candidate moves (analysis overlay)
+OVERLAY_COLORS = (
+    QColor(0x8F, 0xC0, 0x53),   # line 1 — soft green
+    QColor(0x5B, 0xA3, 0xE8),   # line 2 — soft blue
+    QColor(0xE8, 0x9B, 0x4D),   # line 3 — soft orange
+)
 
 FILES = "abcdefgh"
 
@@ -51,7 +66,7 @@ class BoardWidget(QWidget):
         self.setMinimumSize(400, 400)
         self.setMouseTracking(True)
         self.renderer = PieceRenderer(assets_dir)
-        self.board = chess.Board()
+        self.board = chess.Board("r1bq1rk1/p1pnppbp/1p1p1np1/8/3P1B2/2PBPN2/PP1N1PPP/R2QK2R w KQ - 0 8")
         self._armed: chess.Piece | None = None
         self._drag: dict | None = None      # {"kind": "move"|"place"|"propose", ...}
         self._hover_square: int | None = None
@@ -61,14 +76,24 @@ class BoardWidget(QWidget):
         self.propose_mode = False
         self._pending_from: int | None = None
         self._last_move: tuple[int, int] | None = None
+        self._arrow: tuple[int, int] | None = None   # from_square, to_square
+        self._move_overlays: list[tuple[int, int, str]] = []  # (from, to, label)
+        # smooth piece-slide animation (set by animate_move)
+        self._anim: dict | None = None
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(16)            # ~60 fps
+        self._anim_timer.timeout.connect(self._on_anim_tick)
 
     # ------------------------------------------------------------------ state
     def set_fen(self, fen: str) -> None:
         """Replace the position. Raises ValueError on a bad FEN."""
         self.board = chess.Board(fen)
+        self._anim = None
+        self._anim_timer.stop()
         self._drag = None
         self._pending_from = None
         self._last_move = None
+        self._arrow = None
         self.update()
 
     def fen(self) -> str:
@@ -127,6 +152,88 @@ class BoardWidget(QWidget):
         self._last_move = None
         self.update()
 
+    def set_arrow(self, from_square: int, to_square: int) -> None:
+        """Show an accent arrow from ``from_square`` to ``to_square``."""
+        self._arrow = (from_square, to_square)
+        self.update()
+
+    def clear_arrow(self) -> None:
+        self._arrow = None
+        self.update()
+
+    def set_move_overlays(self, items: list[tuple[int, int, str]]) -> None:
+        """Show faint numbered arrows for the engine's candidate first moves.
+
+        ``items`` is a list of ``(from_square, to_square, label)`` triples;
+        each label (e.g. the line number) is drawn on the middle of its arrow.
+        Pass an empty list to hide them.
+        """
+        self._move_overlays = list(items)
+        self.update()
+
+    def clear_move_overlays(self) -> None:
+        self.set_move_overlays([])
+
+    # ---------------------------------------------------------- animation
+    def animate_move(self, move: chess.Move, duration_ms: int = 260) -> None:
+        """Push ``move`` and slide the moving piece(s) to their destination.
+
+        Castling animates both the king and the rook. Falls back to an
+        instant update if the source square is empty (position mismatch).
+        """
+        self._anim = None
+        self._anim_timer.stop()
+
+        movers: list[tuple[chess.Piece, int, int]] = []
+        piece = self.board.piece_at(move.from_square)
+        if piece is not None:
+            movers.append((piece, move.from_square, move.to_square))
+        if self._is_castle(move):
+            to = move.to_square
+            if chess.square_file(to) == 6:          # kingside (g-file)
+                rook_from, rook_to = to + 1, to - 1
+            else:                                   # queenside (c-file)
+                rook_from, rook_to = to - 2, to + 1
+            rook = self.board.piece_at(rook_from)
+            if rook is not None:
+                movers.append((rook, rook_from, rook_to))
+
+        self.board.push(move)
+        if movers:
+            self._anim = {
+                "movers": movers,
+                "t0": time.monotonic(),
+                "dur": max(0.05, duration_ms / 1000.0),
+                "t": 0.0,
+            }
+            self._anim_timer.start()
+        self.update()
+
+    def stop_animation(self) -> None:
+        """Cancel any in-flight piece slide (the position stays as-is)."""
+        self._anim = None
+        self._anim_timer.stop()
+        self.update()
+
+    def _is_castle(self, move: chess.Move) -> bool:
+        """True when ``move`` is a castling move in the current position."""
+        piece = self.board.piece_at(move.from_square)
+        if piece is None or piece.piece_type != chess.KING:
+            return False
+        return abs(chess.square_file(move.to_square)
+                   - chess.square_file(move.from_square)) == 2
+
+    def _on_anim_tick(self) -> None:
+        anim = self._anim
+        if anim is None:
+            self._anim_timer.stop()
+            return
+        anim["t"] = min(1.0, (time.monotonic() - anim["t0"]) / anim["dur"])
+        if anim["t"] >= 1.0:
+            self._anim = None
+            self._anim_timer.stop()
+        self.update()
+
     # ------------------------------------------------------------- geometry
     def _layout(self) -> tuple[float, float, float]:
         """Return (origin_x, origin_y, square_size) for the centred board."""
@@ -142,24 +249,35 @@ class BoardWidget(QWidget):
             return 7 - chess.square_file(sq), chess.square_rank(sq)
         return chess.square_file(sq), 7 - chess.square_rank(sq)
 
+    def _square_at_grid(self, fx: int, fy: int) -> int:
+        """Board square at screen grid position (fx, fy), honouring flip."""
+        if self.flipped:
+            return chess.square(7 - fx, fy)
+        return chess.square(fx, 7 - fy)
+
     def _square_at(self, pos) -> int | None:
         ox, oy, sq = self._layout()
         fx = int((pos.x() - ox) / sq)
         fy = int((pos.y() - oy) / sq)
         if 0 <= fx < 8 and 0 <= fy < 8:
-            if self.flipped:
-                return chess.square(7 - fx, fy)   # rank 1 at the top, h-a files
-            return chess.square(fx, 7 - fy)       # rank 8 at the top, a-h files
+            return self._square_at_grid(fx, fy)
         return None
 
     # ------------------------------------------------------------- painting
     def paintEvent(self, event) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.fillRect(self.rect(), QColor(60, 60, 66))
+        p.fillRect(self.rect(), QColor(theme.BOARD_BG))
         ox, oy, sq = self._layout()
 
+        # rounded frame behind the grid
+        m = max(4.0, sq * 0.07)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(theme.BOARD_FRAME))
+        p.drawRoundedRect(QRectF(ox - m, oy - m, sq * 8 + 2 * m, sq * 8 + 2 * m), m, m)
+
         drag_from = self._drag["from_square"] if self._drag else None
+        anim_dests = {ts for _p, _fs, ts in self._anim["movers"]} if self._anim else set()
 
         for rank in range(8):
             for file in range(8):
@@ -192,12 +310,22 @@ class BoardWidget(QWidget):
                 if self._last_move and sq_i in self._last_move:
                     p.fillRect(rect, LAST_MOVE_HL)
 
-                # piece (hidden on the source square while dragging)
-                if piece and sq_i != drag_from:
+                # piece (hidden on the source square while dragging, and on
+                # the destination square while it is being animated in)
+                if piece and sq_i != drag_from and sq_i not in anim_dests:
                     self.renderer.draw(p, piece, rect)
 
         if self.show_coords:
             self._draw_coords(p, ox, oy, sq)
+
+        if self._arrow:
+            self._draw_arrow(p, ox, oy, sq)
+
+        if self._move_overlays:
+            self._draw_move_overlays(p, ox, oy, sq)
+
+        if self._anim:
+            self._draw_anim_movers(p, ox, oy, sq)
 
         if self._drag:
             self._draw_drag_ghost(p, ox, oy, sq)
@@ -205,27 +333,130 @@ class BoardWidget(QWidget):
         p.end()
 
     def _draw_coords(self, p: QPainter, ox: float, oy: float, sq: float) -> None:
+        """File letters on the bottom screen row, rank numbers on the left
+        screen column — each drawn in the opposite square colour."""
         f = QFont(self.font())
-        f.setPointSizeF(max(6.0, sq * 0.16))
+        f.setPointSizeF(max(6.5, sq * 0.15))
+        f.setBold(True)
         p.setFont(f)
-        p.setPen(COORD_COLOR)
-        w = sq * 0.24
-        if self.flipped:
-            # files along the top edge, ranks along the right edge
-            for file in range(8):
-                x = ox + file * sq
-                p.drawText(QRectF(x + 2, oy + 2, sq, w), FILES[7 - file])
-            for rank in range(8):
-                y = oy + rank * sq
-                p.drawText(QRectF(ox + 8 * sq - w - 4, y + 2, w, w), str(rank + 1))
-        else:
-            # files along the bottom edge, ranks along the left edge
-            for file in range(8):
-                x = ox + file * sq
-                p.drawText(QRectF(x + 2, oy + 8 * sq - w, sq, w), FILES[file])
-            for rank in range(8):
-                y = oy + rank * sq
-                p.drawText(QRectF(ox + 2, y + 2, w, w), str(8 - rank))
+        pad = sq * 0.07
+        w = sq * 0.32
+        for fx in range(8):                       # bottom row -> file letters
+            sq_i = self._square_at_grid(fx, 7)
+            p.setPen(DARK if (fx + 7) % 2 == 0 else LIGHT)
+            rect = QRectF(ox + fx * sq, oy + 7 * sq + sq - w - pad * 0.5, sq - pad, w)
+            p.drawText(rect, Qt.AlignmentFlag.AlignRight, FILES[chess.square_file(sq_i)])
+        for fy in range(8):                       # left column -> rank numbers
+            sq_i = self._square_at_grid(0, fy)
+            p.setPen(DARK if fy % 2 == 0 else LIGHT)
+            rect = QRectF(ox + pad, oy + fy * sq + pad * 0.5, w, w)
+            p.drawText(rect, str(chess.square_rank(sq_i) + 1))
+
+    def _draw_arrow(self, p: QPainter, ox: float, oy: float, sq: float) -> None:
+        """Accent arrow from the source to the target square (move guidance)."""
+        fs, ts = self._arrow
+        fx1, fy1 = self._screen(fs)
+        fx2, fy2 = self._screen(ts)
+        x1 = ox + (fx1 + 0.5) * sq
+        y1 = oy + (fy1 + 0.5) * sq
+        x2 = ox + (fx2 + 0.5) * sq
+        y2 = oy + (fy2 + 0.5) * sq
+        dx, dy = x2 - x1, y2 - y1
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
+            return
+        ux, uy = dx / dist, dy / dist
+
+        # shaft: from just past the source piece, stopping short of the target
+        start = sq * 0.30
+        head = sq * 0.42
+        sx, sy = x1 + ux * start, y1 + uy * start
+        ex, ey = x2 - ux * head, y2 - uy * head
+
+        color = QColor(theme.ACCENT)
+        color.setAlpha(200)
+        p.save()
+        pen = QPen(color, max(3.0, sq * 0.13), Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawLine(QPointF(sx, sy), QPointF(ex, ey))
+
+        # arrowhead
+        nx, ny = -uy, ux
+        w = sq * 0.16
+        tip = QPainterPath()
+        tip.moveTo(x2, y2)
+        tip.lineTo(ex + nx * w, ey + ny * w)
+        tip.lineTo(ex - nx * w, ey - ny * w)
+        tip.closeSubpath()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawPath(tip)
+        p.restore()
+
+    def _draw_move_overlays(self, p: QPainter, ox: float, oy: float, sq: float) -> None:
+        """Faint semi-transparent arrows, one per engine line, each labelled
+        with its line number on the middle of the arrow."""
+        if not self._move_overlays:
+            return
+        r = max(7.0, sq * 0.19)                     # number badge radius
+        for i, (fs, ts, label) in enumerate(self._move_overlays):
+            fx1, fy1 = self._screen(fs)
+            fx2, fy2 = self._screen(ts)
+            x1 = ox + (fx1 + 0.5) * sq
+            y1 = oy + (fy1 + 0.5) * sq
+            x2 = ox + (fx2 + 0.5) * sq
+            y2 = oy + (fy2 + 0.5) * sq
+            dx, dy = x2 - x1, y2 - y1
+            dist = math.hypot(dx, dy)
+            if dist < 1e-6:
+                continue
+            ux, uy = dx / dist, dy / dist
+
+            # shaft: from just past the source piece, stopping short of target
+            start = sq * 0.30
+            head = sq * 0.40
+            sx, sy = x1 + ux * start, y1 + uy * start
+            ex, ey = x2 - ux * head, y2 - uy * head
+
+            color = QColor(OVERLAY_COLORS[i % len(OVERLAY_COLORS)])
+            color.setAlpha(150)
+            p.save()
+            pen = QPen(color, max(2.5, sq * 0.09), Qt.PenStyle.SolidLine,
+                       Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            p.drawLine(QPointF(sx, sy), QPointF(ex, ey))
+
+            # arrowhead
+            nx, ny = -uy, ux
+            w = sq * 0.13
+            tip = QPainterPath()
+            tip.moveTo(x2, y2)
+            tip.lineTo(ex + nx * w, ey + ny * w)
+            tip.lineTo(ex - nx * w, ey - ny * w)
+            tip.closeSubpath()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(color)
+            p.drawPath(tip)
+            p.restore()
+
+            # number badge on the middle of the line (slightly staggered per
+            # line so parallel arrows don't stack their labels on top of each other)
+            off = (i - 1) * sq * 0.05
+            cx = (sx + ex) / 2.0 + nx * off
+            cy = (sy + ey) / 2.0 + ny * off
+            badge = QPainterPath()
+            badge.addEllipse(QPointF(cx, cy), r, r)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(30, 28, 25, 185))
+            p.drawPath(badge)
+            f = QFont(self.font())
+            f.setPointSizeF(max(6.0, r * 0.95))
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(QColor("#ffffff"))
+            p.drawText(QRectF(cx - r, cy - r, 2 * r, 2 * r),
+                       Qt.AlignmentFlag.AlignCenter, label)
 
     def _draw_drag_ghost(self, p: QPainter, ox: float, oy: float, sq: float) -> None:
         piece = self._drag["piece"]
@@ -239,6 +470,17 @@ class BoardWidget(QWidget):
         p.setOpacity(0.75)
         self.renderer.draw(p, piece, rect)
         p.restore()
+
+    def _draw_anim_movers(self, p: QPainter, ox: float, oy: float, sq: float) -> None:
+        """Draw the sliding piece(s) at their eased, interpolated positions."""
+        t = self._anim["t"]
+        eased = 1.0 - (1.0 - t) ** 3        # ease-out cubic: slide, then settle
+        for piece, fs, ts in self._anim["movers"]:
+            fx1, fy1 = self._screen(fs)
+            fx2, fy2 = self._screen(ts)
+            x = ox + (fx1 + (fx2 - fx1) * eased) * sq
+            y = oy + (fy1 + (fy2 - fy1) * eased) * sq
+            self.renderer.draw(p, piece, QRectF(x, y, sq, sq))
 
     # ------------------------------------------------------------- mouse
     def _pos(self, event):
