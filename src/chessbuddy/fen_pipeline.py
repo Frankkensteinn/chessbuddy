@@ -23,17 +23,27 @@ import chess
 
 from .config import WEBBRIDGE_SESSION, WEBBRIDGE_URL
 
-# Reads the board component's own game model (doc: Attempt 3, authoritative).
-# The shadow root is closed, but `state.selectedNode.fen` is exact.
+# chess.com refactored the board component and removed the public `state`
+# property on <wc-chess-board> (it used to be a LitElement reactive prop that
+# held `.selectedNode.fen`). The live game model is now exposed via `cb.game`,
+# which offers getFEN() / getSelectedNode() / isAtEndOfLine() / getPlayingAs().
+# The selected node carries fen/beforeFen/san. This was verified live against a
+# chess.com game on 2026-08-25 after the old `state.selectedNode` path started
+# returning `no wc-chess-board`.
 _EVAL_JS = (
     "(() => { const cb=document.querySelector('wc-chess-board'); "
-    "if (!cb || !cb.state || !cb.state.selectedNode) return JSON.stringify({error:'no wc-chess-board'}); "
-    "const st=cb.state; const n=st.selectedNode; "
+    "if (!cb || !cb.game) return JSON.stringify({error:'no wc-chess-board'}); "
+    "const g=cb.game; "
+    "try { const n=g.getSelectedNode(); "
+    "const fen=(n&&n.fen)?n.fen:g.getFEN(); "
     "return JSON.stringify({"
-    "fen:n.fen, beforeFen:n.beforeFen, san:n.san, "
-    "isAtEnd:st.isAtEndOfLine, "
-    "playingAs:cb.game.getPlayingAs?cb.game.getPlayingAs():null"
-    "}); })()"
+    "fen:fen, "
+    "beforeFen:n?(n.beforeFen||null):null, "
+    "san:n?(n.san||null):null, "
+    "isAtEnd:g.isAtEndOfLine(), "
+    "playingAs:g.getPlayingAs()"
+    "}); } catch(e){ return JSON.stringify({error:'eval-error:'+String(e)}); } "
+    "})()"
 )
 
 
