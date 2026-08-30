@@ -1,4 +1,8 @@
-"""Download official Stockfish 18 prebuilt binaries into Stockfish/prebuilt/.
+"""Download the official Stockfish 18 engine binary into Stockfish/prebuilt/.
+
+Only the engine itself is kept: the release archive (~110 MB of tarball
+containing src/ and wiki/) is downloaded to a temp dir and discarded, so
+prebuilt/<variant>/ ends up with exactly one file.
 
 Auto-detects the OS and CPU and pulls the matching build from the official
 sf_18 GitHub release:
@@ -22,6 +26,7 @@ import platform
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.request
 import zipfile
@@ -34,6 +39,23 @@ TAG = "sf_18"
 
 _OS = sys.platform
 _MACHINE = platform.machine().lower()
+
+# The official .tar bundles the whole repo (src/, wiki/, *.md) next to the
+# engine, so "name starts with stockfish" is not enough to find the binary.
+_JUNK_SUFFIXES = {
+    ".7z", ".bz2", ".c", ".cc", ".cff", ".cpp", ".gz", ".h", ".hpp",
+    ".json", ".md", ".pdf", ".py", ".rst", ".sh", ".tar", ".txt", ".xz",
+    ".yaml", ".yml", ".zip",
+}
+
+
+def _looks_like_engine(name: str, *, executable: bool, size: int) -> bool:
+    low = name.lower()
+    if low.endswith(".exe"):
+        return True
+    if Path(low).suffix in _JUNK_SUFFIXES:
+        return False
+    return executable or size > 1_000_000
 
 
 def _is_x86() -> bool:
@@ -85,24 +107,34 @@ def _extract_binary(archive: Path, outdir: Path) -> Path | None:
     outdir.mkdir(parents=True, exist_ok=True)
     if archive.suffix == ".zip":
         with zipfile.ZipFile(archive) as z:
-            names = [n for n in z.namelist() if n.endswith(".exe")]
-        if not names:
+            infos = [
+                i for i in z.infolist()
+                if not i.is_dir() and _looks_like_engine(
+                    Path(i.filename).name, executable=False, size=i.file_size
+                )
+            ]
+        if not infos:
             return None
         with zipfile.ZipFile(archive) as z:
-            for name in names:
-                target = outdir / Path(name).name
-                with z.open(name) as src, open(target, "wb") as out:
+            for info in infos:
+                target = outdir / Path(info.filename).name
+                with z.open(info) as src, open(target, "wb") as out:
                     out.write(src.read())
                 print(f"[exe ] {target}")
-        return outdir / Path(names[0]).name
+        return outdir / Path(infos[0].filename).name
     if archive.suffix == ".tar":
         with tarfile.open(archive) as t:
-            members = [m for m in t.getmembers() if m.isfile()]
-        picks = [m for m in members if Path(m.name).name.lower().startswith("stockfish")] or members
-        if not picks:
+            members = [
+                m for m in t.getmembers()
+                if m.isfile() and _looks_like_engine(
+                    Path(m.name).name, executable=bool(m.mode & 0o111), size=m.size
+                )
+            ]
+        if not members:
             return None
+        # Biggest file with the exec bit set wins (the engine is ~100 MB).
+        member = max(members, key=lambda m: (bool(m.mode & 0o111), m.size))
         with tarfile.open(archive) as t:
-            member = picks[0]
             target = outdir / Path(member.name).name
             src = t.extractfile(member)
             if src is None:
@@ -111,22 +143,35 @@ def _extract_binary(archive: Path, outdir: Path) -> Path | None:
                 out.write(src.read())
             target.chmod(0o755)
             print(f"[exe ] {target}")
-        return outdir / Path(picks[0].name).name
+        return target
     return None
+
+
+def _fs_is_engine(path: Path) -> bool:
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    return _looks_like_engine(
+        path.name, executable=bool(st.st_mode & 0o111), size=st.st_size
+    )
 
 
 def download(variant: str, fname: str) -> Path | None:
     """Ensure the engine binary for ``variant`` is present under prebuilt/."""
     outdir = PREBUILT / variant
-    existing = [p for p in outdir.glob("*") if p.is_file()] if outdir.is_dir() else []
+    existing = [p for p in sorted(outdir.glob("*")) if p.is_file() and _fs_is_engine(p)] \
+        if outdir.is_dir() else []
     if existing:
         print(f"[skip] {variant}: {existing[0].name} already present")
         return existing[0]
-    archive = PREBUILT / fname
-    if not archive.exists() or archive.stat().st_size < 1_000_000:
-        url = f"https://github.com/official-stockfish/Stockfish/releases/download/{TAG}/{fname}"
+    # Download to a temp dir and throw the archive away afterwards: only the
+    # engine itself ever lands in prebuilt/ (the tarball is ~110 MB of waste).
+    url = f"https://github.com/official-stockfish/Stockfish/releases/download/{TAG}/{fname}"
+    with tempfile.TemporaryDirectory(prefix="sf-dl-") as tmp:
+        archive = Path(tmp) / fname
         _fetch(url, archive)
-    return _extract_binary(archive, outdir)
+        return _extract_binary(archive, outdir)
 
 
 def handshake(path: Path) -> str | None:
@@ -160,7 +205,7 @@ def handshake(path: Path) -> str | None:
 def main() -> int:
     PREBUILT.mkdir(parents=True, exist_ok=True)
     if "--check" in sys.argv:
-        bins = sorted(p for p in PREBUILT.glob("*/*") if p.is_file())
+        bins = sorted(p for p in PREBUILT.glob("*/*") if p.is_file() and _fs_is_engine(p))
         ok = False
         for bin_path in bins:
             name = handshake(bin_path)
