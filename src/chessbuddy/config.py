@@ -10,6 +10,7 @@ the project root:
 from __future__ import annotations
 
 import os
+from enum import Enum
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]             # <repo> (this project)
@@ -17,9 +18,46 @@ ASSETS_DIR = REPO_ROOT / "assets"
 STOCKFISH_DIR = REPO_ROOT / "Stockfish"
 
 WEBBRIDGE_URL = "http://127.0.0.1:10086/command"
+# Both sources share one session: the session only groups tabs for the user's
+# benefit, and find_tab disambiguates by URL.
 WEBBRIDGE_SESSION = "chess-read"
 
+CHESSCOM_TAB_URL = "https://www.chess.com"
+DUO_TAB_URL = "https://www.duolingo.com"
+
+# Backstop only. A Duolingo board image is invalidated by a newer fetch (the
+# ply changed); the TTL just stops a long-forgotten snapshot from being shown
+# as if it were current. See duolingo_pipeline.BoardImage.is_stale.
+DUO_IMAGE_TTL_S = 60
+
 PIECE_NAMES = {1: "pawn", 2: "knight", 3: "bishop", 4: "rook", 5: "queen", 6: "king"}
+
+
+class Source(str, Enum):
+    """Where a position is fetched from.
+
+    The values double as the QComboBox item data and the ``source`` key in
+    QSettings, so they must stay stable.
+    """
+
+    CHESSCOM = "chess.com"
+    DUOLINGO = "duolingo"
+
+    @classmethod
+    def from_value(cls, value: object) -> "Source":
+        """Parse a stored / user-supplied value, falling back to chess.com."""
+        try:
+            return cls(str(value))
+        except ValueError:
+            return cls.CHESSCOM
+
+    @property
+    def label(self) -> str:
+        return self.value
+
+    @property
+    def tab_url(self) -> str:
+        return CHESSCOM_TAB_URL if self is Source.CHESSCOM else DUO_TAB_URL
 
 
 # The official release tarball ships sources and wiki docs named

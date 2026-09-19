@@ -11,7 +11,27 @@ QSS and (given the app) re-applies it, so the whole UI repaints.
 """
 from __future__ import annotations
 
+import sys
 from string import Template
+
+# ------------------------------------------------------------- font stacks
+# Qt resolves only the FIRST family of a QSS ``font-family`` list: if that name
+# does not exist, the rest of the list is ignored outright and the widget falls
+# back to the platform default font. macOS additionally pays a one-off cost
+# when the lookup misses ("Populating font family aliases took N ms") — so the
+# leading name must be one that really exists on the target platform.
+if sys.platform == "darwin":
+    UI_FAMILY = ".AppleSystemUIFont"
+    UI_FONT = f'"{UI_FAMILY}", "Helvetica Neue", sans-serif'
+    MONO_FONT = '"Menlo", monospace'
+elif sys.platform == "win32":
+    UI_FAMILY = "Segoe UI"
+    UI_FONT = f'"{UI_FAMILY}", sans-serif'
+    MONO_FONT = '"Cascadia Mono", "Consolas", monospace'
+else:
+    UI_FAMILY = "DejaVu Sans"
+    UI_FONT = f'"{UI_FAMILY}", "Noto Sans", sans-serif'
+    MONO_FONT = '"DejaVu Sans Mono", "Noto Sans Mono", monospace'
 
 # ------------------------------------------------------------------ palettes
 DARK = {
@@ -137,7 +157,7 @@ _QSS = Template(r"""
 QWidget {
     background: $BG;
     color: $TEXT;
-    font-family: "Segoe UI", "Noto Sans", "Helvetica Neue", sans-serif;
+    font-family: $UI_FONT;
     font-size: 13px;
 }
 QMainWindow, QDialog { background: $BG; }
@@ -239,7 +259,7 @@ QLineEdit {
 }
 QLineEdit:focus { border: 1px solid $ACCENT; }
 QLineEdit#fenEdit {
-    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-family: $MONO_FONT;
     font-size: 12px; color: $FEN_TEXT;
 }
 
@@ -251,6 +271,49 @@ QSlider::handle:horizontal {
 }
 QSlider::handle:horizontal:hover { background: $SLIDER_HANDLE_HI; }
 QSlider::handle:horizontal:disabled { background: $FAINT; }
+
+/* position-source picker (chess.com / duolingo) */
+QComboBox {
+    background: $BG_RAISED;
+    border: 1px solid $BORDER;
+    border-radius: 7px;
+    padding: 5px 8px;
+    min-width: 92px;
+}
+QComboBox:hover { background: $BG_RAISED_HI; }
+QComboBox:disabled { background: $BG_DISABLED; color: $FAINT; border-color: $BORDER_SOFT; }
+QComboBox::drop-down { border: none; background: transparent; width: 18px; }
+QComboBox::down-arrow {
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid $MUTED;
+}
+QComboBox QAbstractItemView {
+    background: $BG_PANEL;
+    border: 1px solid $BORDER;
+    border-radius: 8px;
+    padding: 4px;
+    outline: none;
+    selection-background-color: $ACCENT;
+    selection-color: $ON_ACCENT;
+}
+QComboBox QAbstractItemView::item { padding: 5px 8px; border-radius: 6px; }
+
+/* scroll hosts (explorer move pills, image preview) — the viewport must not
+   paint its own background over the card it sits in */
+QScrollArea { background: transparent; border: none; }
+QScrollArea > QWidget > QWidget { background: transparent; }
+QScrollBar:vertical { background: transparent; width: 9px; margin: 0; }
+QScrollBar::handle:vertical { background: $BORDER; border-radius: 4px; min-height: 26px; }
+QScrollBar::handle:vertical:hover { background: $MUTED; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar:horizontal { background: transparent; height: 9px; margin: 0; }
+QScrollBar::handle:horizontal { background: $BORDER; border-radius: 4px; min-width: 26px; }
+QScrollBar::handle:horizontal:hover { background: $MUTED; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
 
 QCheckBox { spacing: 7px; }
 QCheckBox::indicator {
@@ -281,6 +344,11 @@ QLabel#linePreview  { color: $FAINT; font-size: 11px; }
 QLabel#lineDepth    { color: $FAINT; font-size: 11px; }
 QLabel#explorerTitle { font-weight: 700; font-size: 12px; }
 QLabel#plyLabel     { color: $MUTED; font-size: 11px; }
+QLabel#previewCaption { font-size: 12px; font-weight: 600; }
+QLabel#previewNote    { color: $FAINT; font-size: 11px; }
+QLabel#previewImage {
+    background: $BG_SUNKEN; border: 1px solid $BORDER_SOFT; border-radius: 10px;
+}
 QLabel#blunderResult {
     background: $BG_PANEL; border-radius: 8px;
     padding: 8px 10px; font-size: 12px;
@@ -333,7 +401,9 @@ def current() -> str:
 
 def build_qss(pal: dict | None = None) -> str:
     """Render the stylesheet for a palette (default: the active one)."""
-    return _QSS.substitute(pal if pal is not None else PALETTES[_current_name])
+    return _QSS.substitute(
+        pal if pal is not None else PALETTES[_current_name], UI_FONT=UI_FONT, MONO_FONT=MONO_FONT
+    )
 
 
 APP_QSS = build_qss()

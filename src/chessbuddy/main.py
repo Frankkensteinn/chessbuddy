@@ -15,7 +15,7 @@ def main() -> None:
     app.setApplicationName("ChessBuddy")
     app.setOrganizationName("chessbuddy")
     app.setStyle("Fusion")                 # predictable base for the QSS
-    app.setFont(QFont("Segoe UI", 10))
+    app.setFont(QFont(theme.UI_FAMILY, 10))
     app.setStyleSheet(theme.APP_QSS)
     window = MainWindow()
     window.show()

@@ -9,5 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# macOS
+.DS_Store
+**/.DS_Store
+
 # Downloaded Stockfish binaries (installed by scripts/install_stockfish.py)
 Stockfish/

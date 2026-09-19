@@ -21,6 +21,10 @@ Design
   centipawn loss.
 * A single engine job runs at a time; ``busyChanged`` lets the caller
   disable its buttons while a search is in flight.
+* ``enter_full_game(moves)`` reuses the same explorer to scrub a whole game
+  (a duolingo move history) from the standard start position. The explorer is
+  one shared slot: an engine line and a game history cannot be open at once,
+  and opening either closes the other.
 """
 from __future__ import annotations
 
@@ -33,7 +37,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-    QSlider, QVBoxLayout, QWidget,
+    QScrollArea, QSlider, QVBoxLayout, QWidget,
 )
 
 from . import theme
@@ -45,6 +49,9 @@ _MOVETIME_MS = 1000       # quick analysis budget
 _MULTIPV = 3              # lines shown
 _EVALTIME_MS = 400        # per-position budget for blunder check
 _PLAY_INTERVAL_MS = 900   # playback auto-advance
+_PILL_ROW_H = 30          # one move-number row in the explorer grid
+_PILLS_MAX_H = 208        # cap the visible rows; a whole game scrolls instead
+
 
 
 def san_pv(fen: str, uci_moves: list[str], limit: int = _PV_LIMIT) -> list[str]:
@@ -346,6 +353,9 @@ class LineList(QWidget):
 
 class AnalysisPanel(QWidget):
     busyChanged = pyqtSignal(bool)
+    # The board position changed without the user editing it — playback set it
+    # to some ply. Carries the FEN so the window can keep its FEN box honest.
+    positionChanged = pyqtSignal(str)
 
     def __init__(self, board: BoardWidget, eval_bar: EvalBar | None = None,
                  parent: QWidget | None = None):
@@ -364,8 +374,12 @@ class AnalysisPanel(QWidget):
         self._fen_side = chess.WHITE
         self._fen_fullmove = 1
 
-        # playback state
+        # playback state. ``_base_fen`` is where the plies are counted from,
+        # ``_restore_fen`` is where leaving playback returns to — they differ
+        # for a whole-game history (start position vs. the live position).
         self._base_fen: str | None = None
+        self._restore_fen: str | None = None
+        self._play_kind = "Line"        # prefix for playback status messages
         self._play_moves: list[chess.Move] = []
         self._pills: list[QPushButton] = []
         self._ply = -1
@@ -464,7 +478,18 @@ class AnalysisPanel(QWidget):
         self._pills_grid.setColumnStretch(0, 2)
         self._pills_grid.setColumnStretch(1, 9)
         self._pills_grid.setColumnStretch(2, 9)
-        ex.addWidget(self._pills_host)
+        # A whole game is up to 400 pills: keep them in a height-capped
+        # scroller instead of letting the grid push the panel off the window.
+        self._pills_scroll = QScrollArea()
+        self._pills_scroll.setObjectName("pillsScroll")
+        self._pills_scroll.setWidget(self._pills_host)
+        self._pills_scroll.setWidgetResizable(True)
+        self._pills_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._pills_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._pills_scroll.setFixedHeight(_PILL_ROW_H)
+        ex.addWidget(self._pills_scroll)
 
         scrub = QHBoxLayout()
         scrub.setSpacing(6)
@@ -662,14 +687,65 @@ class AnalysisPanel(QWidget):
             n += 1
         return rows
 
-    def _enter_playback(self, moves: list[chess.Move], title: str) -> None:
+    # -------------------------------------------------------- game history
+    def enter_full_game(self, moves: list[str], restore_fen: str | None = None,
+                        title: str | None = None) -> bool:
+        """Scrub a whole game (a duolingo UCI move history) from the start.
+
+        Leaving playback — Esc, the ✕ button, or clicking an engine line —
+        restores ``restore_fen``: the position the board showed on entry (the
+        live position), never the start position the plies are counted from.
+        Returns False when there is nothing playable.
+        """
+        parsed: list[chess.Move] = []
+        board = chess.Board()                   # history always starts here
+        for i, uci in enumerate(moves):
+            try:
+                move = board.parse_uci(uci)
+            except ValueError:
+                self.status(f"history: move {i + 1} ({uci}) is not playable")
+                return False
+            parsed.append(move)
+            board.push(move)
+        if not parsed:
+            self.status("history: no moves played yet")
+            return False
+
+        # Close any open line first, so ``restore_fen`` names the position the
+        # board really shows rather than a replayed ply of that line.
+        self._exit_playback()
+        self._enter_playback(
+            parsed,
+            title or f"Game history · {len(parsed)} plies",
+            base_fen=chess.STARTING_FEN,
+            restore_fen=restore_fen or self._board.fen(),
+            kind="History",
+        )
+        self._show_ply(len(parsed) - 1)         # land on the live position
+        return True
+
+    def _enter_playback(self, moves: list[chess.Move], title: str,
+                        base_fen: str | None = None,
+                        restore_fen: str | None = None,
+                        kind: str = "Line") -> None:
+        """Show ``moves`` as a scrubbable line.
+
+        ``base_fen`` is the position the plies are counted from — the analysed
+        position for an engine line, the *start* position for a whole game.
+        ``restore_fen`` is where leaving playback returns to; it differs from
+        ``base_fen`` for a full game, where leaving must not snap the board
+        back to the initial position.
+        """
         self._exit_playback(restore=False)
         self._board.set_move_overlays([])       # hide candidate arrows while replaying
-        self._base_fen = self._analyzed_fen or self._board.fen()
+        self._base_fen = base_fen or self._analyzed_fen or self._board.fen()
+        self._restore_fen = restore_fen or self._base_fen
+        self._play_kind = kind
         self._play_moves = moves
         self._board.set_fen(self._base_fen)     # show the base position first
         self._board.set_interactive(False)
         self._board.set_propose_mode(False)
+        self.positionChanged.emit(self._board.fen())
 
         self._ex_title.setText(title)
         self._build_pills()
@@ -711,6 +787,14 @@ class AnalysisPanel(QWidget):
                 pill.clicked.connect(lambda _checked=False, idx=ply: self._on_pill(idx))
                 self._pills_grid.addWidget(pill, r, c)
                 self._pills.append(pill)
+        self._fit_pills_scroll()
+
+    def _fit_pills_scroll(self) -> None:
+        """Size the scroller to its content, capped at ``_PILLS_MAX_H``."""
+        rows = self._pills_grid.rowCount()
+        self._pills_scroll.setFixedHeight(
+            max(_PILL_ROW_H, min(rows * _PILL_ROW_H + 4, _PILLS_MAX_H))
+        )
 
     def _on_pill(self, idx: int) -> None:
         self._timer.stop()
@@ -735,15 +819,18 @@ class AnalysisPanel(QWidget):
             if (pill.property("current") or False) != current:
                 pill.setProperty("current", current)
                 theme.repolish(pill)
+        if 0 <= target < len(self._pills):
+            # keep the highlighted move in view when the grid scrolls
+            self._pills_scroll.ensureWidgetVisible(self._pills[target], 0, 0)
         self._slider.blockSignals(True)
         self._slider.setValue(target + 1)
         self._slider.blockSignals(False)
         self._ply_label.setText(f"{target + 1}/{total}")
 
         if self._ply >= 0:
-            self.status(f"Line · move {self._ply + 1}/{total} · {last_san}")
+            self.status(f"{self._play_kind} · move {self._ply + 1}/{total} · {last_san}")
         else:
-            self.status(f"Line · base position (0/{total})")
+            self.status(f"{self._play_kind} · base position (0/{total})")
         self._prev_btn.setEnabled(self._ply >= 0)
         self._next_btn.setEnabled(self._ply < total - 1)
         self._play_btn.setText("⏸" if self._timer.isActive() else "▶")
@@ -763,19 +850,20 @@ class AnalysisPanel(QWidget):
                 self._board.set_fen(b.fen())
             self._board.set_last_move(move.from_square, move.to_square)
             self._board.set_arrow(move.from_square, move.to_square)
-            return
-        b = chess.Board(self._base_fen)
-        last = None
-        for k in range(target + 1):
-            last = self._play_moves[k]
-            b.push(last)
-        self._board.set_fen(b.fen())
-        if last is not None:
-            self._board.set_last_move(last.from_square, last.to_square)
-            self._board.set_arrow(last.from_square, last.to_square)
         else:
-            self._board.clear_last_move()
-            self._board.clear_arrow()
+            b = chess.Board(self._base_fen)
+            last = None
+            for k in range(target + 1):
+                last = self._play_moves[k]
+                b.push(last)
+            self._board.set_fen(b.fen())
+            if last is not None:
+                self._board.set_last_move(last.from_square, last.to_square)
+                self._board.set_arrow(last.from_square, last.to_square)
+            else:
+                self._board.clear_last_move()
+                self._board.clear_arrow()
+        self.positionChanged.emit(self._board.fen())
 
     def _san_at(self, idx: int) -> str:
         """SAN of the move at ``idx`` in the current playback line."""
@@ -816,17 +904,21 @@ class AnalysisPanel(QWidget):
     def _exit_playback(self, restore: bool = True) -> None:
         self._timer.stop()
         self._board.stop_animation()
-        if restore and self._base_fen and self._play_moves:
+        target = self._restore_fen or self._base_fen
+        if restore and target and self._play_moves:
             try:
-                self._board.set_fen(self._base_fen)
+                self._board.set_fen(target)
             except ValueError:
                 pass
             self._board.clear_last_move()
+            self.positionChanged.emit(self._board.fen())
         self._board.set_interactive(True)
         self._board.set_propose_mode(self._blunder_btn.isChecked())
         self._board.clear_arrow()
         self._play_moves = []
         self._base_fen = None
+        self._restore_fen = None
+        self._play_kind = "Line"
         self._ply = -1
         self._explorer.setVisible(False)
         self._list.set_selected(None)

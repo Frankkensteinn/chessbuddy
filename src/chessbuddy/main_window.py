@@ -1,37 +1,67 @@
-"""Main window: fetch the live FEN from chess.com (via WebBridge), render and
-edit the board, tweak window opacity / always-on-top, and run quick Stockfish
-analysis in the right-hand panel (clickable lines with board playback, plus a
-blunder-check mode that evaluates a move proposed on the board)."""
+"""Main window: fetch the live position from chess.com or duolingo (via
+WebBridge), render and edit the board, tweak window opacity / always-on-top,
+and run quick Stockfish analysis in the right-hand panel (clickable lines with
+board playback, plus a blunder-check mode that evaluates a move proposed on the
+board).
+
+The source picker before the Fetch button chooses how a position is read:
+
+* ``chess.com`` — one live FEN off the board's game model (``fen_pipeline``).
+* ``duolingo``  — one atomic snapshot: the board canvas as a PNG *and* the
+  whole UCI move history, from which the FEN is derived (``duolingo_pipeline``).
+  The canvas is also read back to recover the opponent's reply while Duolingo
+  has not committed it yet, so the position is never a move behind the board.
+  The history can then be scrubbed on the board, and the picture viewed on
+  demand — note that duolingo paints only the live position, so the picture is
+  never the step being scrubbed."""
 from __future__ import annotations
 
 import chess
-from PyQt6.QtCore import QObject, QSettings, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QSettings, QThread, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPushButton, QSlider, QStatusBar, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QMessageBox, QPushButton, QSlider, QStatusBar, QVBoxLayout, QWidget,
 )
 
 from . import theme
 from .analysis_panel import AnalysisPanel, EvalBar
 from .board_widget import BoardWidget
-from .config import ASSETS_DIR
-from .fen_pipeline import FenFetchError, fetch_live_fen
+from .config import ASSETS_DIR, DUO_IMAGE_TTL_S, Source
+from .duolingo_pipeline import BoardImage, fetch_duolingo_snapshot, image_from_snapshot
+from .fen_pipeline import fetch_live_fen
+from .image_preview import ImagePreviewDialog
 from .palette import PiecePalette
+from .webbridge import WebBridgeError
 
 _SIDE_LABEL = {chess.WHITE: "White to move", chess.BLACK: "Black to move"}
 
+_FETCH_TIP = {
+    Source.CHESSCOM: "Reads the live position from the active chess.com tab via WebBridge",
+    Source.DUOLINGO: "Reads the active duolingo chess match via WebBridge: board image + the "
+                     "whole move history, with the ply Duolingo has not recorded yet read "
+                     "back off the board",
+}
+
 
 class FetchWorker(QObject):
-    """Runs the WebBridge FEN fetch off the GUI thread."""
+    """Runs the WebBridge position fetch off the GUI thread."""
+
     success = pyqtSignal(dict)
     failed = pyqtSignal(str)
     finished = pyqtSignal()
 
+    def __init__(self, source: Source = Source.CHESSCOM):
+        super().__init__()
+        self.source = source
+
     @pyqtSlot()
     def run(self) -> None:
         try:
-            self.success.emit(fetch_live_fen())
-        except FenFetchError as exc:
+            if self.source is Source.DUOLINGO:
+                self.success.emit(fetch_duolingo_snapshot())
+            else:
+                self.success.emit(fetch_live_fen())
+        except WebBridgeError as exc:          # both pipelines share this base
             self.failed.emit(str(exc))
         except Exception as exc:               # noqa: BLE001 - report anything
             self.failed.emit(f"Unexpected error: {exc}")
@@ -47,7 +77,18 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(980, 680)
         self._fetch_thread: QThread | None = None
         self._fetch_worker: FetchWorker | None = None
+        self._source = Source.CHESSCOM
+        self._board_image: BoardImage | None = None
+        # TTL backstop: a snapshots stops being offered as "current" if the
+        # app has been left running (see BoardImage.is_stale).
+        self._image_timer = QTimer(self)
+        self._image_timer.setSingleShot(True)
+        self._image_timer.setInterval(int(DUO_IMAGE_TTL_S * 1000))
+        self._image_timer.timeout.connect(self._on_image_ttl)
         self._build_ui()
+
+        saved_source = Source.from_value(QSettings().value("source", Source.CHESSCOM.value))
+        self._restore_source(saved_source)
 
         # restore the saved theme (defaults to dark)
         saved = QSettings().value("theme", "dark")
@@ -71,16 +112,32 @@ class MainWindow(QMainWindow):
         # -- board first (referenced by the top bar) -------------------------
         self._board = BoardWidget(ASSETS_DIR)
 
-        # -- top bar: fetch / analyze / flip | opacity / pin -----------------
+        # -- top bar: source / fetch / analyze / flip | opacity / pin --------
         top = QHBoxLayout()
         top.setSpacing(8)
+        self._source_box = QComboBox()
+        for src in (Source.CHESSCOM, Source.DUOLINGO):
+            self._source_box.addItem(src.label, src.value)
+        self._source_box.setToolTip("Where to read the position from")
+        self._source_box.currentIndexChanged.connect(self._on_source_changed)
+        top.addWidget(self._source_box)
+
         self._fetch_btn = QPushButton("⬇  Fetch position")
         self._fetch_btn.setProperty("accent", True)
-        self._fetch_btn.setToolTip(
-            "Reads the live position from the active chess.com tab via WebBridge"
-        )
+        self._fetch_btn.setToolTip(_FETCH_TIP[Source.CHESSCOM])
         self._fetch_btn.clicked.connect(self._on_fetch_clicked)
         top.addWidget(self._fetch_btn)
+
+        self._preview_btn = QPushButton("🖼  Preview image")
+        self._preview_btn.setEnabled(False)
+        self._preview_btn.clicked.connect(self._on_preview_image)
+        top.addWidget(self._preview_btn)
+
+        self._history_btn = QPushButton("⏱  History")
+        self._history_btn.setEnabled(False)
+        self._history_btn.clicked.connect(self._on_history_clicked)
+        top.addWidget(self._history_btn)
+        self._refresh_snapshot_buttons()
 
         self._analyze_btn = QPushButton("⚡  Analyze")
         self._analyze_btn.setToolTip("1-second quick analysis, 3 lines")
@@ -171,9 +228,122 @@ class MainWindow(QMainWindow):
         self._palette.piecePicked.connect(self._board.set_armed)
         self._board.moveProposed.connect(self._panel.on_move_proposed)
         self._panel.busyChanged.connect(self._on_engine_busy)
+        self._panel.positionChanged.connect(self._on_playback_position)
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ready — fetch a live position or edit the board", 6000)
+
+    # ----------------------------------------------------------------- source
+    def _restore_source(self, source: Source) -> None:
+        """Select ``source`` without writing it back to QSettings."""
+        idx = self._source_box.findData(source.value)
+        self._source_box.blockSignals(True)
+        self._source_box.setCurrentIndex(idx if idx >= 0 else 0)
+        self._source_box.blockSignals(False)
+        self._apply_source(source)
+
+    def _apply_source(self, source: Source) -> None:
+        self._source = source
+        self._fetch_btn.setToolTip(_FETCH_TIP[source])
+        self._refresh_snapshot_buttons()
+
+    def _on_source_changed(self, index: int) -> None:
+        source = Source.from_value(self._source_box.itemData(index))
+        self._apply_source(source)
+        QSettings().setValue("source", source.value)
+        self.statusBar().showMessage(f"Position source: {source.label}", 4000)
+
+    # ------------------------------------------------------------- snapshots
+    def _set_board_image(self, image: BoardImage | None) -> None:
+        """Replace the stored board image unconditionally.
+
+        A newer fetch always wins: an image from a different ply is stale even
+        if it is only seconds old, so the ply — not the TTL — is the primary
+        invalidation rule. The TTL timer is only a backstop against showing a
+        long-forgotten snapshot as if it were current.
+        """
+        self._board_image = image
+        self._image_timer.stop()
+        if image is not None:
+            self._image_timer.start()
+        self._refresh_snapshot_buttons()
+
+    def _on_image_ttl(self) -> None:
+        image = self._board_image
+        if image is not None and image.is_stale():
+            self._board_image = None
+            self._refresh_snapshot_buttons()
+
+    def _refresh_snapshot_buttons(self) -> None:
+        """Gate the duolingo-only buttons.
+
+        Two different kinds of "not now":
+
+        * the chess.com source is selected — the control does not apply at all,
+          so it is struck through as well as greyed out (a hover tooltip says
+          why). Any snapshot already in memory is kept, so switching back to
+          duolingo makes it available again;
+        * duolingo is selected but nothing has been fetched yet — plain disabled.
+        """
+        if self._source is not Source.DUOLINGO:
+            self._set_snapshot_button(
+                self._preview_btn, False, struck=True,
+                tip="Board-image preview is duolingo-only — chess.com gives a "
+                    "position, not a board picture",
+            )
+            self._set_snapshot_button(
+                self._history_btn, False, struck=True,
+                tip="Game-history scrubbing is duolingo-only — chess.com sends "
+                    "the current position, not the move list",
+            )
+            return
+
+        image = self._board_image
+        if image is None:
+            self._set_snapshot_button(
+                self._preview_btn, False,
+                tip=f"Fetch from {Source.DUOLINGO.label} to capture the board image",
+            )
+            self._set_snapshot_button(
+                self._history_btn, False,
+                tip=f"Fetch from {Source.DUOLINGO.label} to get the move history",
+            )
+            return
+
+        self._set_snapshot_button(
+            self._preview_btn, True,
+            tip=f"{image.width}×{image.height} PNG · {image.caption()}",
+        )
+        self._set_snapshot_button(
+            self._history_btn, bool(image.moves),
+            tip=(f"Scrub all {image.ply} plies of the fetched game"
+                 if image.moves else "No moves played yet"),
+        )
+
+    @staticmethod
+    def _set_snapshot_button(button: QPushButton, available: bool,
+                             tip: str, struck: bool = False) -> None:
+        button.setEnabled(available)
+        button.setToolTip(tip)
+        font = button.font()
+        if font.strikeOut() != struck:
+            font.setStrikeOut(struck)
+            button.setFont(font)
+
+    def _on_preview_image(self) -> None:
+        if self._board_image is None:
+            return
+        ImagePreviewDialog(self._board_image, self).exec()
+
+    def _on_history_clicked(self) -> None:
+        image = self._board_image
+        if image is None or not image.moves:
+            return
+        if self._panel.enter_full_game(list(image.moves)):
+            self.statusBar().showMessage(
+                f"Browsing {image.ply} plies from the start position — "
+                "Esc returns to the live position", 8000
+            )
 
     # ---------------------------------------------------------------- actions
     def _refresh_side(self) -> None:
@@ -185,11 +355,18 @@ class MainWindow(QMainWindow):
     def _on_fetch_clicked(self) -> None:
         if self._fetch_thread is not None:
             return
+        source = self._source
         self._fetch_btn.setEnabled(False)
-        self.statusBar().showMessage("Fetching live FEN from chess.com via WebBridge…")
+        self._source_box.setEnabled(False)
+        if source is Source.DUOLINGO:
+            self.statusBar().showMessage(
+                "Fetching the duolingo board image + move history via WebBridge…"
+            )
+        else:
+            self.statusBar().showMessage("Fetching live FEN from chess.com via WebBridge…")
 
         self._fetch_thread = QThread(self)
-        self._fetch_worker = FetchWorker()
+        self._fetch_worker = FetchWorker(source)
         self._fetch_worker.moveToThread(self._fetch_thread)
         self._fetch_thread.started.connect(self._fetch_worker.run)
         self._fetch_worker.success.connect(self._on_fetch_ok)
@@ -204,8 +381,15 @@ class MainWindow(QMainWindow):
         self._fetch_thread = None
         self._fetch_worker = None
         self._fetch_btn.setEnabled(True)
+        self._source_box.setEnabled(True)
 
     def _on_fetch_ok(self, data: dict) -> None:
+        if "png" in data:                      # duolingo: snapshot + history
+            self._on_duolingo_ok(data)
+        else:                                  # chess.com: a bare live FEN
+            self._on_fen_ok(data)
+
+    def _on_fen_ok(self, data: dict) -> None:
         fen = data["fen"]
         try:
             self._board.set_fen(fen)
@@ -227,16 +411,52 @@ class MainWindow(QMainWindow):
         parts.append(f"{who} to move")
         self.statusBar().showMessage("FEN loaded · " + " · ".join(parts), 8000)
 
+    def _on_duolingo_ok(self, data: dict) -> None:
+        fen = data["fen"]
+        try:
+            self._board.set_fen(fen)
+        except ValueError as exc:
+            self._on_fetch_err(f"Invalid FEN derived from the duolingo history: {exc}")
+            return
+        self._fen_edit.setText(fen)
+        self._refresh_side()
+        self._panel.on_position_changed()
+        # The image and the history came back from one evaluate, so the PNG
+        # belongs to exactly this ply; a new fetch replaces it outright.
+        self._set_board_image(image_from_snapshot(data))
+
+        who = "White" if self._board.board.turn == chess.WHITE else "Black"
+        parts = [f"duolingo · ply {data['ply']}", f"{who} to move"]
+        if data.get("recovered"):
+            # Duolingo commits a ply to its move history only when the next user
+            # move is submitted (in practice the opponent's reply), so the ply
+            # was read off the board instead of leaving the position behind it.
+            parts.append(f"{data['recovered']} read off the board")
+        if data.get("status"):
+            parts.append(f"status {data['status']}")
+        parts.append("image + history ready")
+        message = "Position loaded · " + " · ".join(parts)
+        if data.get("canvas_state") == "unreconciled":
+            message += ("  ⚠ the board on screen could not be lined up with "
+                        "Duolingo's move history — fetch again once it settles")
+        self.statusBar().showMessage(message, 12000)
+
     def _on_fetch_err(self, message: str) -> None:
         self.statusBar().showMessage("Fetch failed", 8000)
-        QMessageBox.warning(
-            self,
-            "Fetch failed",
-            "Could not read the live FEN from the browser.\n\n"
-            f"{message}\n\n"
-            "Make sure the WebBridge daemon is running and you have a chess.com "
-            "game open in the active tab. You can also edit the board below manually.",
-        )
+        if self._source is Source.DUOLINGO:
+            hint = (
+                "Make sure the WebBridge daemon is running and a duolingo chess "
+                "match is open in the active tab. You can also edit the board "
+                "below manually."
+            )
+            title = "Fetch failed · duolingo"
+        else:
+            hint = (
+                "Make sure the WebBridge daemon is running and you have a chess.com "
+                "game open in the active tab. You can also edit the board below manually."
+            )
+            title = "Fetch failed · chess.com"
+        QMessageBox.warning(self, title, f"Could not read the live position.\n\n{message}\n\n{hint}")
 
     def _on_analyze(self) -> None:
         fen = self._board.fen()
@@ -288,6 +508,12 @@ class MainWindow(QMainWindow):
         self._refresh_side()
         self._panel.on_position_changed()
 
+    def _on_playback_position(self, fen: str) -> None:
+        """Playback (an engine line or a game history) moved the board to some
+        ply: mirror it in the FEN box, without disturbing the playback state."""
+        self._fen_edit.setText(fen)
+        self._refresh_side()
+
     def _on_apply_fen(self) -> None:
         fen = self._fen_edit.text().strip()
         try:
@@ -302,6 +528,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Position applied", 4000)
 
     def closeEvent(self, event) -> None:
+        self._image_timer.stop()
         if self._fetch_thread is not None:
             self._fetch_thread.quit()
             self._fetch_thread.wait(1000)
