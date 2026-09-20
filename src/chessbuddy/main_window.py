@@ -4,6 +4,14 @@ and run quick Stockfish analysis in the right-hand panel (clickable lines with
 board playback, plus a blunder-check mode that evaluates a move proposed on the
 board).
 
+After an analysis the window also offers the **What-if** view: the same
+position, but as an expandable move tree on an infinite canvas (see
+``graph_view`` and ``docs/whatif-graph-plan.md``). The two views are pages of
+one ``QStackedWidget`` and share a single cursor position, so leaving the graph
+puts the board on the node you were looking at — and, because that is a
+*display* move like replaying a line, the analysis and the tree both survive,
+so going back picks up exactly where you were.
+
 The source picker before the Fetch button chooses how a position is read:
 
 * ``chess.com`` — one live FEN off the board's game model (``fen_pipeline``).
@@ -20,7 +28,8 @@ import chess
 from PyQt6.QtCore import QObject, QSettings, QThread, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPushButton, QSlider, QStatusBar, QVBoxLayout, QWidget,
+    QMainWindow, QMessageBox, QPushButton, QSlider, QStackedWidget, QStatusBar,
+    QVBoxLayout, QWidget,
 )
 
 from . import theme
@@ -28,7 +37,9 @@ from .analysis_panel import AnalysisPanel, EvalBar
 from .board_widget import BoardWidget
 from .config import ASSETS_DIR, DUO_IMAGE_TTL_S, Source
 from .duolingo_pipeline import BoardImage, fetch_duolingo_snapshot, image_from_snapshot
+from .engine_service import EngineService
 from .fen_pipeline import fetch_live_fen
+from .graph_view import WhatIfView
 from .image_preview import ImagePreviewDialog
 from .palette import PiecePalette
 from .webbridge import WebBridgeError
@@ -78,6 +89,9 @@ class MainWindow(QMainWindow):
         self._fetch_thread: QThread | None = None
         self._fetch_worker: FetchWorker | None = None
         self._source = Source.CHESSCOM
+        # One engine for the whole window: the analysis panel and the what-if
+        # graph take turns on it, never in parallel.
+        self._engine = EngineService(self)
         self._board_image: BoardImage | None = None
         # TTL backstop: a snapshots stops being offered as "current" if the
         # app has been left running (see BoardImage.is_stale).
@@ -103,9 +117,8 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        board_page = QWidget()
+        layout = QVBoxLayout(board_page)
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(10)
 
@@ -143,6 +156,17 @@ class MainWindow(QMainWindow):
         self._analyze_btn.setToolTip("1-second quick analysis, 3 lines")
         self._analyze_btn.clicked.connect(self._on_analyze)
         top.addWidget(self._analyze_btn)
+
+        self._whatif_btn = QPushButton("⑂  What-if")
+        self._whatif_btn.setToolTip(
+            "Open the analysed position as an expandable move tree — branch, "
+            "re-branch and zoom around it"
+        )
+        self._whatif_btn.clicked.connect(self._enter_whatif)
+        # Hidden until an analysis has actually finished: the tree grows out
+        # of those three lines and out of nothing else.
+        self._whatif_btn.setVisible(False)
+        top.addWidget(self._whatif_btn)
 
         self._flip_btn = QPushButton("⇅  Flip")
         self._flip_btn.setToolTip("Toggle White's / Black's point of view")
@@ -197,7 +221,8 @@ class MainWindow(QMainWindow):
         middle.addWidget(self._eval_bar, 0)
 
         middle.addWidget(self._board, 1)
-        self._panel = AnalysisPanel(self._board, eval_bar=self._eval_bar)
+        self._panel = AnalysisPanel(self._board, eval_bar=self._eval_bar,
+                                    engine=self._engine)
         middle.addWidget(self._panel, 0)
         layout.addLayout(middle, 1)
 
@@ -227,8 +252,17 @@ class MainWindow(QMainWindow):
         self._board.armedChanged.connect(self._palette.sync)
         self._palette.piecePicked.connect(self._board.set_armed)
         self._board.moveProposed.connect(self._panel.on_move_proposed)
-        self._panel.busyChanged.connect(self._on_engine_busy)
+        self._engine.busyChanged.connect(self._on_engine_busy)
         self._panel.positionChanged.connect(self._on_playback_position)
+        self._panel.analyzedChanged.connect(self._on_analyzed_changed)
+
+        # -- pages: board (0) and the what-if graph (1) -----------------------
+        self._whatif = WhatIfView(self._engine, self._board.renderer)
+        self._whatif.exited.connect(self._exit_whatif)
+        self._stack = QStackedWidget()
+        self._stack.addWidget(board_page)
+        self._stack.addWidget(self._whatif)
+        self.setCentralWidget(self._stack)
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ready — fetch a live position or edit the board", 6000)
@@ -471,6 +505,59 @@ class MainWindow(QMainWindow):
         self._analyze_btn.setEnabled(not busy)
         self._panel._blunder_btn.setEnabled(not busy)
 
+    # ------------------------------------------------------------- what-if
+    def _on_analyzed_changed(self, ready: bool) -> None:
+        """An analysis finished (or went stale): offer the tree, or take it away."""
+        self._whatif_btn.setVisible(ready)
+        if ready:
+            return
+        if self._whatif.is_active():
+            self._exit_whatif()
+        self._whatif.on_anchor_lost()
+
+    def _enter_whatif(self) -> None:
+        fen = self._panel.analyzed_fen()
+        lines = self._panel.lines()
+        if not fen or not lines:
+            self.statusBar().showMessage(
+                "What-if needs an analysis — press Analyze first", 5000)
+            return
+        # Never anchor the tree to a replayed ply of an engine line: close the
+        # explorer first so the analysed position really is what is on the board.
+        self._panel.leave_playback()
+        self._whatif.enter(fen, lines, self._board.flipped)
+        self._stack.setCurrentIndex(1)
+        self._whatif.set_active(True)
+        self.statusBar().showMessage(
+            "What-if — click a node to see that position, Enter to lay out its "
+            "candidates, drag a piece to branch, Esc returns to the board", 12000)
+
+    def _exit_whatif(self) -> None:
+        """Back to the board, on the node the cursor was last on.
+
+        This only *shows* another position — exactly like replaying a line —
+        so the analysis and the tree both survive and the view can be entered
+        again where you left it. A tree is only dropped when the analysed
+        position itself changes (§3.2).
+        """
+        if not self._whatif.is_active():
+            return
+        self._whatif.set_active(False)
+        self._stack.setCurrentIndex(0)
+        fen = self._whatif.cursor_fen()
+        if fen and fen != self._board.fen():
+            try:
+                self._board.set_fen(fen)
+            except ValueError:
+                fen = None
+            if fen:
+                self._on_playback_position(fen)
+                self.statusBar().showMessage(
+                    "Board moved to the what-if cursor — the analysis and the "
+                    "tree are still there, so What-if resumes where you were",
+                    10000)
+        self._board.setFocus()
+
     # ---------------------------------------------------------------- widgets
     def _on_opacity(self, value: int) -> None:
         self.setWindowOpacity(value / 100.0)
@@ -502,6 +589,7 @@ class MainWindow(QMainWindow):
         # painted widgets read the palette at paint time; force a repaint
         self._board.update()
         self._eval_bar.update()
+        self._whatif.refresh_theme()
 
     def _on_board_edited(self, fen: str) -> None:
         self._fen_edit.setText(fen)
@@ -532,5 +620,6 @@ class MainWindow(QMainWindow):
         if self._fetch_thread is not None:
             self._fetch_thread.quit()
             self._fetch_thread.wait(1000)
+        self._whatif.shutdown()
         self._panel.shutdown()
         super().closeEvent(event)

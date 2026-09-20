@@ -88,6 +88,16 @@ DARK = {
     "EVAL_LIGHT": "#ece9e6",
     "EVAL_DARK": "#403d39",
     "EVAL_CHIP_BG": "#141312",
+
+    # what-if graph (drawn by hand: QGraphicsItem ignores the QSS entirely)
+    "GRAPH_BG": "#1c1a18",          # the infinite canvas
+    "GRAPH_EDGE": "#48433e",        # parent -> child connectors
+    "NODE_BG": "#3d3a37",
+    "NODE_BORDER": "#5c574f",
+    "NODE_TEXT": "#ecebea",
+    "NODE_FAINT": "#918c86",        # unsearched: a prediction, not a number
+    "NODE_TERMINAL": "#57534e",     # mate / stalemate: filled solid
+    "NODE_ENGINE": "#5ba3e8",       # left stripe: came from the engine
 }
 
 LIGHT = {
@@ -141,6 +151,15 @@ LIGHT = {
     "EVAL_LIGHT": "#f4f2ee",
     "EVAL_DARK": "#57524a",
     "EVAL_CHIP_BG": "#3a3733",
+
+    "GRAPH_BG": "#e4ded3",
+    "GRAPH_EDGE": "#c3bcaf",
+    "NODE_BG": "#ffffff",
+    "NODE_BORDER": "#b6afa2",
+    "NODE_TEXT": "#2b2823",
+    "NODE_FAINT": "#8b857b",
+    "NODE_TERMINAL": "#57524a",
+    "NODE_ENGINE": "#2f6fc4",
 }
 
 PALETTES = {"dark": DARK, "light": LIGHT}
@@ -271,6 +290,17 @@ QSlider::handle:horizontal {
 }
 QSlider::handle:horizontal:hover { background: $SLIDER_HANDLE_HI; }
 QSlider::handle:horizontal:disabled { background: $FAINT; }
+
+/* segmented board ⇄ what-if switch */
+QPushButton#segBtn { padding: 6px 12px; }
+QPushButton#segBtn:checked {
+    background: $ACCENT; border-color: $ACCENT;
+    color: $ON_ACCENT; font-weight: 700;
+}
+
+/* the what-if node detail bar */
+QLabel#nodeMove { font-size: 15px; font-weight: 700; }
+QLabel#nodeHint { color: $FAINT; font-size: 11px; }
 
 /* position-source picker (chess.com / duolingo) */
 QComboBox {

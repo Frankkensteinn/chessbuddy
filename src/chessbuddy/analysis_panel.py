@@ -20,7 +20,11 @@ Design
   candidate move vs. the best move (two short searches) and reports the
   centipawn loss.
 * A single engine job runs at a time; ``busyChanged`` lets the caller
-  disable its buttons while a search is in flight.
+  disable its buttons while a search is in flight. The engine itself is an
+  injected :class:`~chessbuddy.engine_service.EngineService`, so the what-if
+  graph can share it: one subprocess, one job slot, no parallel searches.
+* A finished analysis arms ``analyzedChanged(True)`` — the what-if view is
+  built on exactly that state and is hidden again the moment it is gone.
 * ``enter_full_game(moves)`` reuses the same explorer to scrub a whole game
   (a duolingo move history) from the standard start position. The explorer is
   one shared slot: an engine line and a game history cannot be open at once,
@@ -28,10 +32,8 @@ Design
 """
 from __future__ import annotations
 
-import threading
-
 import chess
-from PyQt6.QtCore import QObject, QThread, Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QFont, QKeySequence, QPainter, QPainterPath, QShortcut,
 )
@@ -42,9 +44,11 @@ from PyQt6.QtWidgets import (
 
 from . import theme
 from .board_widget import BoardWidget
-from .engine import EngineError, StockfishClient, pick_stockfish, score_text
+from .engine import EngineError, score_text
+from .engine_service import EngineService
 
-_PV_LIMIT = 12            # max plies shown / replayed per line
+_PV_LIMIT = 20            # max plies shown / replayed per line (the what-if
+                          # tree lays out the same number — graph_model.PV_LIMIT)
 _MOVETIME_MS = 1000       # quick analysis budget
 _MULTIPV = 3              # lines shown
 _EVALTIME_MS = 400        # per-position budget for blunder check
@@ -115,6 +119,15 @@ class EvalBar(QWidget):
         self._text = score_text(info)
         self.update()
 
+    def set_unknown(self) -> None:
+        """No evaluation to show yet (an unsearched what-if node).
+
+        Deliberately not 0.00: an even bar with a '0.00' chip would read as a
+        measurement, and there is no measurement to show."""
+        self._frac = 0.5
+        self._text = "…"
+        self.update()
+
     def paintEvent(self, event) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -151,29 +164,6 @@ class EvalBar(QWidget):
             p.setPen(QColor("#ffffff"))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._text)
         p.end()
-
-
-class _AnalyzeWorker(QObject):
-    """Runs one engine job (``fn(stop, info_signal)``) off the GUI thread."""
-
-    info = pyqtSignal(object)
-    done = pyqtSignal(object)
-    failed = pyqtSignal(str)
-    finished = pyqtSignal()
-
-    def __init__(self, fn, stop_event: threading.Event):
-        super().__init__()
-        self._fn = fn
-        self._stop = stop_event
-
-    @pyqtSlot()
-    def run(self) -> None:
-        try:
-            self.done.emit(self._fn(self._stop, self.info))
-        except Exception as exc:                  # noqa: BLE001 - surface any failure
-            self.failed.emit(str(exc))
-        finally:
-            self.finished.emit()
 
 
 def _cp_of(info: dict, color: bool) -> float | None:
@@ -356,18 +346,22 @@ class AnalysisPanel(QWidget):
     # The board position changed without the user editing it — playback set it
     # to some ply. Carries the FEN so the window can keep its FEN box honest.
     positionChanged = pyqtSignal(str)
+    # A usable analysis exists (True) or no longer does (False). The what-if
+    # view is only offered while it is True.
+    analyzedChanged = pyqtSignal(bool)
 
     def __init__(self, board: BoardWidget, eval_bar: EvalBar | None = None,
+                 engine: EngineService | None = None,
                  parent: QWidget | None = None):
         super().__init__(parent)
         self._board = board
         self.setFixedWidth(360)
 
-        self._client: StockfishClient | None = None
+        # One engine for the whole window: the panel may be handed the
+        # window's service, or start its own when used standalone.
+        self._engine = engine if engine is not None else EngineService(self)
+        self._engine.busyChanged.connect(self._set_busy)
         self._engine_name = "Stockfish"
-        self._worker: _AnalyzeWorker | None = None
-        self._thread: QThread | None = None
-        self._stop_event: threading.Event | None = None
         self._busy = False
         self._lines: dict[int, dict] = {}
         self._analyzed_fen: str | None = None
@@ -521,41 +515,29 @@ class AnalysisPanel(QWidget):
 
     # ------------------------------------------------------------- engine
     def _ensure_client(self) -> None:
-        if self._client is not None:
-            return
-        path, name = pick_stockfish()
-        client = StockfishClient(path)
-        client.handshake()
-        self._client = client
-        self._engine_name = name
-        self._title.setText(name)
+        if self._engine.client is None:
+            self._engine.ensure_client()
+        # The panel may have been handed an engine someone else already
+        # started (the window shares one), so the name is read back rather
+        # than assumed to be arriving now.
+        name = self._engine.engine_name()
+        if name != self._engine_name:
+            self._engine_name = name
+            self._title.setText(name)
 
     def _set_busy(self, busy: bool) -> None:
+        if self._busy == busy:
+            return
         self._busy = busy
         self.busyChanged.emit(busy)
 
     def _start_job(self, fn, on_done) -> None:
-        self._stop_event = threading.Event()
-        self._thread = QThread(self)
-        self._worker = _AnalyzeWorker(fn, self._stop_event)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.info.connect(self._on_live_info)
-        self._worker.done.connect(on_done)
-        self._worker.done.connect(self._on_job_finished)
-        self._worker.failed.connect(self._on_job_failed)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.finished.connect(self._on_worker_cleared)
-        self._thread.start()
-        self._set_busy(True)
+        """Queue one engine job (the panel's own callbacks are wired in)."""
+        self._engine.submit(fn, on_info=self._on_live_info, on_done=on_done,
+                            on_failed=self._on_job_failed)
 
     def _cancel_job(self) -> None:
-        if self._stop_event is not None:
-            self._stop_event.set()
-        if self._client is not None:
-            self._client.stop()
+        self._engine.cancel()
 
     # ------------------------------------------------------------ analysis
     def analyze(self, fen: str) -> None:
@@ -582,9 +564,12 @@ class AnalysisPanel(QWidget):
         self._fen_fullmove = board.fullmove_number
         self._eval_bar.set_eval({"score_cp": 0, "score_mate": None}, self._fen_side)
         self.status(f"{self._engine_name} · analyzing (1s)…")
+        # Until this search finishes there is no complete analysis to hand to
+        # the what-if view, so it is disarmed for the whole run.
+        self.analyzedChanged.emit(False)
 
         def run(stop, info_sig):
-            return self._client.analyze(
+            return self._engine.client.analyze(
                 fen, movetime_ms=_MOVETIME_MS, multipv=_MULTIPV,
                 on_info=lambda info: info_sig.emit(info), stop=stop,
             )
@@ -612,6 +597,8 @@ class AnalysisPanel(QWidget):
             self.status(f"{self._engine_name} · best {result['bestmove']} — click a line to explore it")
         else:
             self.status("search stopped")
+        if self._lines:
+            self.analyzedChanged.emit(True)
 
     def _populate_list(self) -> None:
         fen = self._analyzed_fen
@@ -974,12 +961,12 @@ class AnalysisPanel(QWidget):
 
         def run(stop, _info_sig):
             stm = board.turn
-            root = self._client.analyze(
+            root = self._engine.client.analyze(
                 fen, movetime_ms=_EVALTIME_MS, multipv=1, stop=stop
             )["lines"].get(1)
             if stop.is_set() or root is None:
                 return {"cancelled": True}
-            cand = self._client.analyze(
+            cand = self._engine.client.analyze(
                 after_fen, movetime_ms=_EVALTIME_MS, multipv=1, stop=stop
             )["lines"].get(1)
             if stop.is_set() or cand is None:
@@ -1013,30 +1000,38 @@ class AnalysisPanel(QWidget):
     def status(self, text: str) -> None:
         self._status_label.setText(text)
 
+    def analyzed_fen(self) -> str | None:
+        """The position the current lines belong to (None: nothing analysed)."""
+        return self._analyzed_fen
+
+    def lines(self) -> dict[int, dict]:
+        """The current engine lines, keyed by MultiPV number."""
+        return dict(self._lines)
+
+    def leave_playback(self) -> None:
+        """Close the explorer and put the board back on the analysed position.
+
+        Called before handing the position to another view, so that view is
+        never anchored to a replayed ply of an engine line.
+        """
+        self._exit_playback()
+
     def on_position_changed(self) -> None:
         """The board was edited/fetched/applied: drop stale analysis and exit
         playback without overwriting the user's position."""
         self._lines.clear()
         self._list.clear()
         self._analyzed_fen = None
+        self.analyzedChanged.emit(False)
         self._apply_overlays()
         self._exit_playback(restore=False)
         self._eval_bar.set_eval({"score_cp": 0, "score_mate": None}, chess.WHITE)
         self._set_blunder_text("")
         self.status("Position changed — press Analyze")
 
-    def _on_job_finished(self, _result) -> None:
-        self._set_busy(False)
-
     def _on_job_failed(self, message: str) -> None:
-        self._set_busy(False)
         self.status("engine error")
         self._flash_error(message)
-
-    def _on_worker_cleared(self) -> None:
-        self._worker = None
-        self._thread = None
-        self._stop_event = None
 
     def _flash_error(self, message: str) -> None:
         QMessageBox.warning(self, "Stockfish", message)
@@ -1044,10 +1039,4 @@ class AnalysisPanel(QWidget):
     def shutdown(self) -> None:
         """Stop any running job and release the engine (call on window close)."""
         self._timer.stop()
-        self._cancel_job()
-        if self._thread is not None:
-            self._thread.quit()
-            self._thread.wait(2000)
-        if self._client is not None:
-            self._client.quit()
-            self._client = None
+        self._engine.shutdown()

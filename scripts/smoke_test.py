@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QBuffer, QByteArray, QSettings  # noqa: E402
+from PyQt6.QtCore import QBuffer, QByteArray, QPointF, QSettings  # noqa: E402
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QLabel  # noqa: E402
 
@@ -21,9 +21,11 @@ import chess  # noqa: E402
 
 from chessbuddy import analysis_panel as ap  # noqa: E402
 from chessbuddy import duolingo_canvas as dcv  # noqa: E402
+from chessbuddy import graph_model as gm  # noqa: E402
+from chessbuddy import graph_view as Gv  # noqa: E402
 from chessbuddy import theme  # noqa: E402
 from chessbuddy.analysis_panel import AnalysisPanel, san_pv  # noqa: E402
-from chessbuddy.board_widget import BoardWidget  # noqa: E402
+from chessbuddy.board_widget import BoardMode, BoardWidget  # noqa: E402
 from chessbuddy.config import ASSETS_DIR, Source  # noqa: E402
 from chessbuddy.duolingo_pipeline import (  # noqa: E402
     _SNAP_JS, BoardImage, DuolingoFetchError, _check_board_fen, _decode_png,
@@ -116,6 +118,429 @@ def _replay(moves) -> chess.Board:
     for uci in moves:
         board.push_uci(uci)
     return board
+
+
+# ------------------------------------------------------------- what-if tree
+def _tree_checks() -> None:
+    """The what-if tree's rules, with no canvas involved."""
+    # identity (§3.1): the same position reached two ways is two nodes, so
+    # "how did I get here" stays unique — which is the only reason Δ means
+    # anything; the engine cache is keyed by FEN instead, so the transposition
+    # still reuses a search.
+    tree = gm.Tree(chess.STARTING_FEN)
+    node = tree.root
+    for uci in ("g1f3", "g8f6", "f3g1", "f6g8"):
+        node = tree.add_child(node, uci, source="user")
+    assert chess.Board(node.fen).board_fen() \
+        == chess.Board(tree.root.fen).board_fen(), node.fen
+    assert node.fen != tree.root.fen, "the counters really did move on"
+    assert gm.cache_key(node.fen) == gm.cache_key(tree.root.fen), "same position"
+    assert gm.cache_key(node.fen) != node.fen, "the move counters must not key it"
+    assert node.id != tree.root.id and len(tree.nodes) == 5
+    assert node.id == "root/g1f3/g8f6/f3g1/f6g8", node.id
+    # the cache is keyed by *position*, so the four-move shuffle hits it
+    assert tree.eval_cache == {}
+    tree.eval_cache[gm.cache_key(node.fen)] = {"lines": {1: {"score_cp": 7}}, "t": 0.0}
+    assert tree.eval_cache[gm.cache_key(tree.root.fen)]["lines"][1]["score_cp"] == 7
+    # an existing child comes back, it is never duplicated
+    assert tree.add_child(tree.root, "g1f3") is tree.nodes["root/g1f3"]
+
+    # Δ (§5.1): the loss is measured from the side that had to choose, so the
+    # same White-relative numbers have to flip for a Black move.
+    parent = gm.Node(id="p", parent=None, move=None,
+                     fen="4k3/8/8/8/8/8/8/4K3 w - - 0 1")
+    child = gm.Node(id="c", parent=parent, move=chess.Move.from_uci("e1e2"),
+                    fen="4k3/8/8/8/8/8/4K3/8 b - - 1 1")
+    parent.eval_cp, child.eval_cp = 30, -10          # White +0.30 → -0.10
+    assert gm.delta_cp(parent, child) == 40, gm.delta_cp(parent, child)
+    parent.fen = child.fen                           # now Black had to choose
+    parent.eval_cp, child.eval_cp = -30, 40          # Black +0.30 → White +0.40
+    assert gm.delta_cp(parent, child) == 70, gm.delta_cp(parent, child)
+    # a move the engine rates *better* than the parent's own best line comes
+    # out negative (search noise) rather than clamped to no loss at all
+    child.eval_cp = -40
+    assert gm.delta_cp(parent, child) == -10, gm.delta_cp(parent, child)
+    child.eval_cp = None
+    assert gm.delta_cp(parent, child) is None, "an unsearched child has no Δ"
+    parent.eval_cp = None
+    assert gm.delta_cp(parent, child) is None, "an unsearched parent has none either"
+
+    # lanes (§4.2): the first child keeps the parent's row, a later sibling is
+    # inserted below the previous sibling's whole subtree, and — the property
+    # the viewport anchor depends on — an insertion never moves an ancestor.
+    tree = gm.Tree(chess.STARTING_FEN)
+    main = tree.grow_line(tree.root, ["e2e4", "e7e5", "g1f3", "b8c6"])
+    tree.relayout()
+    assert [n.lane for n in main] == [0, 0, 0, 0], [n.lane for n in main]
+    assert [n.ply for n in main] == [1, 2, 3, 4]
+    side = tree.add_child(tree.root, "d2d4")         # a second root child
+    tree.relayout()
+    assert side.lane == 1, side.lane
+    assert [n.lane for n in main] == [0, 0, 0, 0], "a main line must not drift"
+    deep = tree.add_child(main[-1], "d2d4")          # deeper, on the main line
+    tree.relayout()
+    assert deep.lane == 0 and deep.ply == 5, "a first child keeps its parent's row"
+    before = (tree.root.lane, [n.lane for n in main])
+    # deep's *next* sibling goes below deep's whole subtree, and the shift
+    # pushes the unrelated lane below it further down
+    extra = tree.add_child(deep, "e5d4")
+    tree.relayout()
+    assert extra.lane == 0 and extra.ply == 6
+    fork = tree.add_child(deep, "f8b4")
+    tree.relayout()
+    assert fork.lane == 1, fork.lane
+    assert side.lane == 2, "the lane under the insertion point shifts down"
+    assert (tree.root.lane, [n.lane for n in main]) == before, \
+        "an insertion may not move anything above it"
+    assert tree.lanes() == 3 and tree.plies() == 6
+    # the ply stays a plain distance from the root whatever the lanes do
+    assert fork.ply == 6 and all(n.ply == len(tree.path_to(n)) - 1
+                                 for n in tree.nodes.values())
+
+    # a terminal position is drawn but never searched (§7)
+    mate = gm.Tree("6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1")
+    assert mate.root.searchable
+    mated = mate.add_child(mate.root, "a1a8")
+    assert chess.Board(mated.fen).is_checkmate(), mated.san
+    assert not mated.searchable, "a mate is drawn, but there is nothing to search"
+    mate.relayout()
+    assert mated.ply == 1 and mated.lane == 0
+    # pruning (§5.4): killing a node takes its whole branch and nothing else,
+    # and a *candidate* lane that dies by hand puts its parent back to
+    # expandable — otherwise the ＋ that laid it out could never come back
+    pruned = gm.Tree(chess.STARTING_FEN)
+    lane = pruned.grow_line(pruned.root, ["e2e4", "e7e5", "g1f3"])
+    pruned.root.candidates = {1: {"pv": ["e2e4"]}}
+    pruned.root.spawned.append(lane[0].id)
+    assert not gm.can_expand(pruned.root) and gm.can_collapse(pruned.root)
+    gone = pruned.remove_subtree(lane[1])
+    assert [n.id for n in gone] == [lane[1].id, lane[2].id], [n.id for n in gone]
+    assert set(pruned.nodes) == {pruned.root.id, lane[0].id}
+    assert lane[0].children == [] and pruned.root.children == [lane[0]]
+    assert pruned.remove_subtree(pruned.root) == [], "the anchor is not removable"
+    # collapse folds exactly the candidate lanes back and the node survives,
+    # expandable again — and the engine cache is none of its business, since
+    # it is keyed by position and a folded lane costs nothing to grow back
+    assert pruned.collapse(pruned.root) == [lane[0]]
+    assert set(pruned.nodes) == {pruned.root.id} and not pruned.root.spawned
+    assert gm.can_expand(pruned.root), "a collapsed node must be expandable again"
+    pruned.relayout()
+    print(f"what-if model OK: {len(tree.nodes)} nodes, {tree.lanes()} lanes, "
+          f"transposition ids differ, Δ flips with the mover")
+
+
+def _whatif_checks(app) -> None:
+    """The whole view: entry, search, expand, branch, leave, and re-entry."""
+    win = MainWindow()
+    win.resize(1300, 900)
+    win._board.set_fen(FEN)
+    win.show()
+    # the button is gated on a *finished* analysis, not on a started one
+    assert not win._whatif_btn.isVisible(), "What-if before an analysis"
+    win._panel.analyze(FEN)
+    assert not win._whatif_btn.isVisible(), "What-if while the analysis runs"
+    if win._engine.thread:
+        win._engine.thread.wait(20000)
+    app.processEvents()
+    assert win._whatif_btn.isVisible(), "What-if after the analysis"
+
+    win._enter_whatif()
+    app.processEvents()
+    wi = win._whatif
+    tree = wi._tree
+    canvas = wi._canvas
+    assert win._stack.currentIndex() == 1 and wi.is_active()
+    # three engine lines became three lanes for free; nothing was searched
+    assert tree.lanes() == 3, tree.lanes()
+    assert len(tree.nodes) > 3 * 4, len(tree.nodes)
+    assert tree.root.lit and not tree.root.children[0].lit, "only the root is lit"
+    assert win._engine.busy is False, "entering must not start a search"
+    # the opening picture is at a zoom whose nodes still carry their text
+    assert Gv.LOD_TEXT <= canvas.zoom_factor() <= Gv.ZOOM_MAX, canvas.zoom_factor()
+    assert canvas.item_for(tree.root) is not None
+    assert len(canvas._items) == len(tree.nodes)
+    assert canvas.width() > 300 and canvas.height() > 300
+
+    # picking a node searches it once (MultiPV) and lights it up
+    target = tree.root.children[1].children[0]
+    lane_before, nodes_before = target.lane, len(tree.nodes)
+    canvas.select_node(target)
+    if win._engine.thread:
+        win._engine.thread.wait(20000)
+    app.processEvents()
+    assert target.lit, "a clicked node must light up"
+    assert target.depth and target.eval_cp is not None
+    assert sorted(target.candidates) == [1, 2, 3], sorted(target.candidates)
+    assert target.delta_cp == gm.delta_cp(target.parent, target)
+    assert wi._move_label.text() == gm.move_text(target)
+    assert wi._depth_label.text() == f"d{target.depth}"
+    assert "Δ" in wi._delta_label.text(), wi._delta_label.text()
+    # the dock board shows the node, with its candidates as the usual arrows
+    assert wi._board.fen() == target.fen
+    assert len(wi._board._move_overlays) == len(target.candidates)
+    assert target.lane == lane_before, "selecting must not re-layout"
+
+    # expand is free: it re-lays the candidates that same search returned
+    assert gm.can_expand(target) and wi._expand_btn.isEnabled()
+    assert wi._expand_btn.text().startswith("＋")
+    kids_before = len(target.children)
+    children_before_expand = list(target.children)
+    wi.expand_cursor()
+    app.processEvents()
+    assert len(tree.nodes) > nodes_before, "expand added nothing"
+    assert win._engine.busy is False, "expanding must not search"
+    # the node already had a PV continuation, so only the *other* candidates
+    # arrive as new children — and each one heads its own chain
+    appended = target.children[kids_before:]
+    assert appended, "no candidate lanes were laid out"
+    assert appended[0].note.startswith("引擎候选 #"), appended[0].note
+    # only the *heads* of the new lanes are remembered as spawned: the rest of
+    # a chain is a variation continuation, and collapse must not fold that —
+    # nor the lane the node was already continuing (candidate #1 usually *is*
+    # that move, and ``add_child`` hands the same node back), nor a branch the
+    # user grew by hand
+    assert target.spawned == [c.id for c in appended], target.spawned
+    assert all(c.children for c in appended), "a lane head must head a chain"
+    assert len(tree.nodes) - nodes_before > len(appended), "the chains came along"
+    # the button is the toggle's other half: once the candidates are out there
+    # is nothing left to expand, and the chip says so instead of greying out
+    assert not gm.can_expand(target) and gm.can_collapse(target)
+    assert wi._expand_btn.isEnabled() and wi._expand_btn.text().startswith("−")
+    assert canvas.item_for(target).marker_action() == "collapse"
+
+    # ... and the same key folds them back in: the node stays, the lanes go,
+    # and the node ends up expandable again rather than stuck
+    lanes = [tree.nodes[cid] for cid in target.spawned]
+    expanded_nodes = len(tree.nodes)
+    nodes_after_expand = list(tree.nodes)
+    wi.expand_cursor()
+    app.processEvents()
+    assert len(tree.nodes) < expanded_nodes, "collapse removed nothing"
+    assert target.id in tree.nodes and canvas.item_for(target) is not None
+    assert target.children == children_before_expand, "collapse took too much"
+    assert not (set(tree.nodes) - set(nodes_after_expand)), "collapse made a node"
+    assert not target.spawned and gm.can_expand(target) and not gm.can_collapse(target)
+    assert canvas.item_for(target).marker_action() == "expand"
+    assert not wi._expand_btn.text().startswith("−"), wi._expand_btn.text()
+    assert win._engine.busy is False, "folding back must not search either"
+    # re-expanding is a redraw again — same ids in the same order, same count,
+    # still no search, and no lane left dangling in the canvas
+    wi.expand_cursor()
+    app.processEvents()
+    assert len(tree.nodes) == expanded_nodes, len(tree.nodes)
+    assert [c.id for c in target.children] \
+        == [c.id for c in children_before_expand] + [c.id for c in appended]
+    assert all(c.id in tree.nodes for c in lanes), "a folded lane stayed dangling"
+    assert set(canvas._items) == set(tree.nodes)
+    wi.expand_cursor()                       # leave it folded for the next block
+    app.processEvents()
+
+    # killing a branch takes the node, its move and everything under it, and
+    # nothing above it — and a cursor parked inside the doomed subtree has to
+    # come out of it rather than point at a node that no longer exists.
+    # The victim is the last lane the root owns: a whole engine line, which is
+    # what a user actually wants gone when a candidate turns out to be junk.
+    victim = tree.root.children[-1]
+    assert victim.parent is tree.root and victim.children
+    parent = victim.parent
+    # what the right-click actually offers, and to whom (§5.4): the ＋/−
+    # entries mirror the same toggle the chip does, and only the root has no
+    # delete — the tree is anchored to it
+    menu, verbs = canvas.item_for(victim).node_menu()
+    state = {verb: action.isEnabled() for action, verb in verbs.items()}
+    assert set(verbs.values()) == {"expand", "collapse", "kill"}
+    assert state == {"expand": gm.can_expand(victim),
+                     "collapse": gm.can_collapse(victim), "kill": True}, state
+    menu.deleteLater()
+    root_menu, root_verbs = canvas.item_for(tree.root).node_menu()
+    assert {v: a.isEnabled() for a, v in root_verbs.items()}["kill"] is False
+    root_menu.deleteLater()
+    doomed = {n.id for n in tree.subtree(victim)}
+    deepest = [n for n in tree.subtree(victim) if not n.children][-1]
+    total = len(tree.nodes)
+    # a delete with something behind it asks first, and a "no" changes nothing
+    asked: list[tuple[str, str]] = []
+    wi._confirm = lambda title, text: (asked.append((title, text)), False)[1]
+    wi.kill_branch(victim)
+    app.processEvents()
+    assert asked and "删除" in asked[0][0], asked
+    assert "取消" in wi._status.text(), wi._status.text()
+    assert len(tree.nodes) == total and parent.children, "a refused delete moved it"
+    # a leaf has nothing behind it to lose, so it goes without a dialog
+    leaf = next(n for n in tree.nodes.values()
+                if not n.children and n.parent and n.id not in doomed)
+    asks_before = len(asked)
+    wi._confirm = lambda title, text: (asked.append((title, text)), True)[1]
+    wi.kill_branch(leaf)
+    app.processEvents()
+    assert len(asked) == asks_before, "a leaf must not raise a dialog"
+    assert leaf.id not in tree.nodes and len(tree.nodes) == total - 1
+
+    canvas.select_node(deepest)
+    siblings = len(parent.children)
+    wi.kill_branch(victim)
+    app.processEvents()
+    assert not (doomed & set(tree.nodes)), "a killed node is still in the tree"
+    assert parent.id in tree.nodes and len(parent.children) == siblings - 1
+    assert victim.id not in {c.id for c in parent.children}
+    assert set(canvas._items) == set(tree.nodes), "the canvas kept a dead item"
+    assert canvas.item_for(victim) is None and canvas.item_for(deepest) is None
+    assert wi._cursor is parent, "the cursor fell into a dead branch"
+    assert canvas.cursor() is parent
+    assert all(cid in tree.nodes
+               for n in tree.nodes.values() for cid in n.spawned), \
+        "a spawned lane id outlived the node it pointed at"
+    tree.relayout()
+    assert all(n.ply == len(tree.path_to(n)) - 1 for n in tree.nodes.values())
+
+    # the root is the one node that cannot go: it is the tree's anchor (§3.2)
+    keep_nodes, keep_fen = len(tree.nodes), wi.cursor_fen()
+    wi.kill_branch(tree.root)
+    assert len(tree.nodes) == keep_nodes and wi.cursor_fen() == keep_fen
+    assert "根节点" in wi._status.text(), wi._status.text()
+    canvas.select_node(target)               # back where the drag block left it
+
+    # ... and the wires are actually drawn: a child that inherits its parent's
+    # lane gets a *straight* wire, whose bounding rect has zero height — which
+    # QRectF.intersects calls empty, so the old culling test dropped exactly
+    # the wires on a main line and left the elbows. Sample the gap between the
+    # two boxes instead of trusting the code to look right.
+    canvas.reset_zoom(tree.root)
+    app.processEvents()
+    shot = canvas.grab().toImage()
+    root_a = canvas.item_for(tree.root).mapToScene(
+        canvas.item_for(tree.root).box()).boundingRect()
+    kid_b = canvas.item_for(tree.root.children[0]).mapToScene(
+        canvas.item_for(tree.root.children[0]).box()).boundingRect()
+    assert abs(root_a.center().y() - kid_b.center().y()) < 0.5, "not a main line"
+    mid = canvas.mapFromScene(
+        QPointF((root_a.right() + kid_b.left()) / 2.0, root_a.center().y()))
+    assert canvas.viewport().rect().contains(mid), "the wire is off screen"
+    column = {shot.pixelColor(mid.x(), mid.y() + dy).name()
+              for dy in range(-2, 3)}
+    assert column != {theme.GRAPH_BG.lower()}, \
+        "the straight wire on the main line was not painted"
+
+    # a dragged move branches, and inserting it must not move the cursor node
+    pos = canvas.item_for(target).scenePos()
+    move = next(iter(chess.Board(target.fen).legal_moves))
+    before = len(tree.nodes)
+    edits: list[str] = []
+    wi._board.boardEdited.connect(edits.append)
+    wi._board.set_mode(BoardMode.BRANCH)
+    wi._board.set_armed(chess.Piece(chess.QUEEN, chess.WHITE))
+    assert wi._board._armed is None, "BRANCH mode must refuse a palette piece"
+    wi._board._try_branch(move.from_square, move.to_square)
+    assert len(tree.nodes) == before + 1, "the drag did not branch"
+    assert wi._cursor.parent is target and wi._cursor.source == "user"
+    assert wi._cursor.move == move and wi._cursor.note == "你的分支"
+    assert not edits, "BRANCH mode must never edit the position"
+    assert wi._board.fen() == wi._cursor.fen, "the board follows the new node"
+    assert canvas.item_for(target).scenePos() == pos, \
+        "an insertion moved the cursor node on screen"
+    if win._engine.thread:
+        win._engine.thread.wait(20000)
+    app.processEvents()
+    assert wi._cursor.lit, "a new branch is searched straight away"
+    assert wi._cursor.delta_cp is not None, "Δ needs the parent's eval"
+    # ... while a wrong-colour drag is simply ignored
+    n_before = len(tree.nodes)
+    wi._board.board.set_piece_at(chess.E4, chess.Piece(chess.PAWN, chess.BLACK))
+    wi._board._try_branch(chess.E4, chess.E5)
+    assert len(tree.nodes) == n_before
+    wi._board.board.set_piece_at(chess.E4, None)
+    # ... and so is an illegal one
+    empty = next(s for s in chess.SQUARES if wi._board.board.piece_at(s) is None)
+    wi._board._try_branch(move.from_square, empty)
+    assert len(tree.nodes) == n_before
+
+    # navigation: ←/→ walk the line, ↑/↓ change lanes, Home goes home
+    holder = next(n for n in tree.nodes.values() if len(n.children) >= 2)
+    row = holder.children
+    canvas.select_node(row[0])
+    assert canvas.cursor() is row[0]
+    wi._nav_back()
+    assert wi._cursor is holder
+    wi._nav_forward()
+    assert wi._cursor is row[0]
+    wi._nav_sibling(1)
+    assert wi._cursor is row[1]
+    wi._nav_sibling(-1)
+    assert wi._cursor is row[0]
+    wi._nav_sibling(-1)
+    assert wi._cursor is row[0], "the end of a sibling row must not wrap"
+    wi._nav_home()
+    assert wi._cursor is tree.root
+    assert len(canvas._scene.path_ids) == 1        # only the root is on the path
+    assert canvas.item_for(tree.root).zValue() > canvas.item_for(row[0]).zValue()
+
+    # zoom tiers: every level of detail has to paint at every size
+    for factor in (1.4, 0.8, 0.45, 0.2):
+        canvas.reset_zoom()
+        canvas.zoom_by(factor)
+        app.processEvents()
+        shot = canvas.grab()
+        assert not shot.isNull() and shot.width() > 100, factor
+        assert abs(canvas.zoom_factor() - factor) < 0.01, canvas.zoom_factor()
+    assert wi._zoom_label.text().endswith("%"), wi._zoom_label.text()
+    canvas.fit()
+    assert Gv.ZOOM_MIN <= canvas.zoom_factor() <= Gv.ZOOM_MAX
+
+    # PGN of the current path
+    canvas.select_node(row[0])
+    wi.copy_pgn()
+    pgn = QApplication.clipboard().text()
+    assert '[SetUp "1"]' in pgn and pgn.rstrip().endswith("*"), pgn[:120]
+    assert wi._status.text().startswith("已复制"), wi._status.text()
+
+    # the 跟随 switch is the one control whose effect is a viewport move, so
+    # it says what it does when it is thrown — otherwise it reads as a mystery
+    wi._follow_check.setChecked(False)
+    assert "跟随关闭" in wi._status.text(), wi._status.text()
+    wi._follow_check.setChecked(True)
+    assert "跟随开启" in wi._status.text(), wi._status.text()
+
+    # leaving puts the cursor position on the board *without* dropping the
+    # analysis or the tree — a display move, like replaying a line
+    nodes = len(tree.nodes)
+    cursor_fen = wi.cursor_fen()
+    win._exit_whatif()
+    app.processEvents()
+    assert win._stack.currentIndex() == 0 and not wi.is_active()
+    assert win._board.fen() == cursor_fen, win._board.fen()
+    assert win._fen_edit.text() == cursor_fen, win._fen_edit.text()
+    assert win._panel.analyzed_fen() == FEN, "the analysis must survive"
+    assert win._whatif_btn.isVisible()
+    win._enter_whatif()
+    app.processEvents()
+    assert len(wi._tree.nodes) == nodes, "re-entry must reuse the tree"
+    assert wi.cursor_fen() == cursor_fen, "re-entry must keep the cursor"
+
+    # the light theme repaints the canvas from the palette: a QGraphicsItem
+    # ignores the QSS entirely, so this is the only thing that can
+    theme.apply("light", app)
+    wi.refresh_theme()
+    app.processEvents()
+    light = canvas.grab().toImage()
+    assert light.pixelColor(6, 6).name() == theme.GRAPH_BG.lower(), \
+        light.pixelColor(6, 6).name()
+    theme.apply("dark", app)
+    wi.refresh_theme()
+    app.processEvents()
+    dark = canvas.grab().toImage()
+    assert dark.pixelColor(6, 6).name() == theme.GRAPH_BG.lower()
+    assert dark.pixelColor(6, 6) != light.pixelColor(6, 6)
+
+    # a real position change does drop it (§3.2)
+    win._exit_whatif()
+    win._board.board.set_piece_at(chess.E4, chess.Piece(chess.QUEEN, chess.WHITE))
+    win._board.boardEdited.emit(win._board.fen())
+    app.processEvents()
+    assert wi._tree is None and not win._whatif_btn.isVisible()
+    assert canvas.cursor() is None and len(canvas._items) == 0, "dangling nodes"
+    win.close()
+    print(f"what-if view OK: 3 lanes on entry, searched/expanded/branched, "
+          f"re-entry kept {nodes} nodes, both themes paint")
 
 
 def main() -> int:
@@ -335,8 +760,8 @@ def main() -> int:
     # 5. analysis panel (offscreen, short) + board flip + propose mode
     panel = AnalysisPanel(board)
     panel.analyze(FEN)
-    if panel._thread:
-        panel._thread.wait(15000)
+    if panel._engine.thread:
+        panel._engine.thread.wait(15000)
     app.processEvents()
     print("panel lines:", panel._list.count(), "| status:", panel._status_label.text())
     print("board overlays:", [(f, t, n) for f, t, n in board._move_overlays])
@@ -437,6 +862,10 @@ def main() -> int:
     assert win._preview_btn.isEnabled(), "the image is still viewable at ply 0"
     win.close()
     print("snapshot bookkeeping OK")
+
+    # 5g. what-if tree: the model's rules first, then the view on top of them
+    _tree_checks()
+    _whatif_checks(app)
 
     # 6. webbridge (may fail gracefully — that is OK)
     try:

@@ -15,3 +15,6 @@ wheels/
 
 # Downloaded Stockfish binaries (installed by scripts/install_stockfish.py)
 Stockfish/
+
+# Local design notes and planning documents
+docs/

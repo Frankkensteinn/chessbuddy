@@ -44,6 +44,19 @@ Two things worth knowing:
 - When the board cannot be lined up with the history at all — a piece mid-animation, or one held in your hand — the fetch says so in the status bar (`⚠ the board on screen could not be lined up…`) and keeps the history's position rather than inventing a ply. Fetch again once the board settles. The read is already retried three times, 250 ms apart, for exactly this.
 - Duolingo's own move list has a back-stepping UI. If you have scrubbed back in it, the canvas shows that ply and the fetch refuses rather than filing a stale position under a "live" label — return to the live position and fetch again.
 
+## What-if view
+
+Once **Analyze** has finished, **What-if** turns the analysed position into a move tree on an infinite canvas. It is a separate page with its own board, and the two views share one cursor: leaving the graph puts the board on the node you were last looking at.
+
+- **Entering is free.** The three engine lines become three lanes — each line laid out as a chain of nodes, x = ply, y = lane — without a single new search.
+- **Grey vs lit is the whole point.** A grey node is a prediction from an engine line: it has a position (click it and the board jumps there) but no evaluation yet. Clicking it runs one 600 ms `MultiPV=3` search which both lights it up — eval, depth, and its Δ against the parent's best move — and remembers its three continuations, so **Enter** (or the `+` under a node) can lay those candidates out with no further search at all.
+- **Drag a piece** on the dock board to branch. Any legal move of the side to move becomes a child, is searched straight away, and gets its own Δ — the same centipawns Blunder check reports, computed against whatever the parent's search said. Branching is unbounded: a new branch can be branched again.
+- **Keys:** `←`/`→` walk the line, `↑`/`↓` change lanes, `Home` to the root, `Esc` back to the board, `Enter` to expand. Pan by dragging the background, wheel to scroll, Cmd/Ctrl+wheel (or `+`/`-`) to zoom, `0` to fit. Zoomed out, nodes drop to shapes and then to plain blocks so the outline of the tree — forks, chains, empty space — stays readable.
+- **Leaving keeps everything.** Moving the board to the cursor is a display move, exactly like replaying a line: the analysis and the tree both survive, so What-if resumes where you were. Editing or re-fetching the position *does* drop the tree, because the tree belongs to the position it grew from.
+- **Shallow is labelled as shallow.** Every number carries its depth, and a Δ under 10 cp is reported as the noise band rather than as a different choice: a 600 ms search is a starting point, not a verdict.
+
+Layout rules, the Δ arithmetic, the engine budget and the deliberate non-goals are specified in `docs/whatif-graph-plan.md`; `scripts/smoke_test.py` covers the model's invariants (node identity, lane insertion, Δ) and the view end to end (entry, expand, branch, re-entry, both themes).
+
 ---
 
 Board piece SVGs: [cburnett chess set](https://commons.wikimedia.org/wiki/Category:SVG_chess_pieces) (CC BY-SA 3.0, via Wikimedia Commons).

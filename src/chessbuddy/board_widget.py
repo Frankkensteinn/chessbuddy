@@ -13,10 +13,22 @@ Editing model
 Extra modes
 -----------
 * ``set_flipped`` / ``toggle_flip``   -> mirror the board (Black's view).
-* ``set_propose_mode(True)``          -> drags become move proposals: emit
-  ``moveProposed(move)`` for a legal move of the side to move, never edit.
-* ``set_interactive(False)``          -> ignore all mouse edits (used while
-  replaying an engine line on the board).
+* ``set_mode(BoardMode)``             -> the one switch for the four mutually
+  exclusive input modes below. ``interactive`` / ``propose_mode`` are kept as
+  the flags the painting code reads, but they are now *derived* from ``mode``
+  by every setter, so a new mode can never end up fighting an old boolean:
+
+  | mode | behaviour |
+  |---|---|
+  | ``EDIT``    | the default: palette placement, free piece dragging |
+  | ``PROPOSE`` | drags become move proposals: emit ``moveProposed(move)`` |
+  | ``LOCKED``  | ignore all mouse edits (line playback on the board) |
+  | ``BRANCH``  | drag a legal move of the side to move -> ``branchMove``; the
+  |             | position itself can never be edited (the what-if tree) |
+
+* ``set_propose_mode(True)``          -> ``PROPOSE`` (kept for the blunder
+  check toggle, which predates the enum).
+* ``set_interactive(False)``          -> ``LOCKED``.
 * ``set_last_move``                   -> highlight the from/to squares of the
   most recent move (used by line playback).
 * ``set_move_overlays``               -> faint numbered arrows for candidate
@@ -29,6 +41,7 @@ from __future__ import annotations
 
 import math
 import time
+from enum import Enum
 
 import chess
 from PyQt6.QtCore import QPointF, Qt, QRectF, QTimer, pyqtSignal
@@ -37,6 +50,16 @@ from PyQt6.QtWidgets import QWidget
 
 from . import theme
 from .pieces import PieceRenderer
+
+
+class BoardMode(str, Enum):
+    """What a drag on the board means (see the module docstring)."""
+
+    EDIT = "edit"
+    PROPOSE = "propose"
+    LOCKED = "locked"
+    BRANCH = "branch"
+
 
 LIGHT = QColor("#f0d9b5")
 DARK = QColor("#b58863")
@@ -60,20 +83,25 @@ class BoardWidget(QWidget):
     boardEdited = pyqtSignal(str)      # FEN after any edit
     armedChanged = pyqtSignal(object)  # chess.Piece or None
     moveProposed = pyqtSignal(object)  # chess.Move (blunder-check mode)
+    branchMove = pyqtSignal(object)    # chess.Move (what-if branch mode)
 
-    def __init__(self, assets_dir=None, parent: QWidget | None = None):
+    def __init__(self, assets_dir=None, renderer: PieceRenderer | None = None,
+                 parent: QWidget | None = None):
         super().__init__(parent)
         self.setMinimumSize(400, 400)
         self.setMouseTracking(True)
-        self.renderer = PieceRenderer(assets_dir)
+        # A second board (the what-if view has its own) can share this one,
+        # which keeps the SVG set parsed once per window.
+        self.renderer = renderer if renderer is not None else PieceRenderer(assets_dir)
         self.board = chess.Board("r1bq1rk1/p1pnppbp/1p1p1np1/8/3P1B2/2PBPN2/PP1N1PPP/R2QK2R w KQ - 0 8")
         self._armed: chess.Piece | None = None
-        self._drag: dict | None = None      # {"kind": "move"|"place"|"propose", ...}
+        self._drag: dict | None = None      # {"kind": "move"|"place"|"propose"|"branch", ...}
         self._hover_square: int | None = None
         self.show_coords = True
         self.flipped = False
-        self.interactive = True
-        self.propose_mode = False
+        self.mode = BoardMode.EDIT
+        self.interactive = True             # derived from ``mode``
+        self.propose_mode = False           # derived from ``mode``
         self._pending_from: int | None = None
         self._last_move: tuple[int, int] | None = None
         self._arrow: tuple[int, int] | None = None   # from_square, to_square
@@ -100,8 +128,8 @@ class BoardWidget(QWidget):
         return self.board.fen()
 
     def set_armed(self, piece: chess.Piece | None) -> None:
-        if self.propose_mode and piece is not None:
-            return                      # no palette placement while proposing
+        if piece is not None and self.mode in (BoardMode.PROPOSE, BoardMode.BRANCH):
+            return                      # no placement while proposing/branching
         self._armed = piece
         self.armedChanged.emit(piece)
         self.setCursor(
@@ -127,6 +155,11 @@ class BoardWidget(QWidget):
 
     def set_interactive(self, on: bool) -> None:
         self.interactive = on
+        # BRANCH is only ever entered through ``set_mode``; the legacy flags
+        # must not be able to fall out of it by accident.
+        if self.mode is not BoardMode.BRANCH:
+            self.mode = (BoardMode.EDIT if on else BoardMode.LOCKED) \
+                if not self.propose_mode else BoardMode.PROPOSE
         if not on:
             self._drag = None
             self._pending_from = None
@@ -136,12 +169,33 @@ class BoardWidget(QWidget):
         self.propose_mode = on
         self._drag = None
         self._pending_from = None
+        if self.mode is not BoardMode.BRANCH:
+            self.mode = BoardMode.PROPOSE if on else BoardMode.EDIT
         if on:
             self._armed = None
             self.armedChanged.emit(None)
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def set_mode(self, mode: BoardMode) -> None:
+        """Switch input mode (see the module docstring).
+
+        The two legacy booleans stay the flags the painting and mouse code
+        read, but they are re-derived here, so no mode can be entered with
+        a stale flag left behind — which is exactly the failure a third
+        boolean would have introduced.
+        """
+        self.mode = mode
+        self.interactive = mode is not BoardMode.LOCKED
+        self.propose_mode = mode is BoardMode.PROPOSE
+        self._drag = None
+        self._pending_from = None
+        self.unsetCursor()
+        if mode in (BoardMode.PROPOSE, BoardMode.BRANCH):
+            self._armed = None
+            self.armedChanged.emit(None)
         self.update()
 
     def set_last_move(self, from_square: int, to_square: int) -> None:
@@ -491,6 +545,23 @@ class BoardWidget(QWidget):
             return
         sq = self._square_at(self._pos(event))
         if event.button() == Qt.MouseButton.LeftButton:
+            if self.mode is BoardMode.BRANCH:
+                # Only the side to move may be dragged, and the move has to be
+                # legal: the position itself is never edited here.
+                if sq is None:
+                    return
+                if self._pending_from is not None:
+                    self._try_branch(self._pending_from, sq)
+                    self._clear_proposal()
+                else:
+                    piece = self.board.piece_at(sq)
+                    if piece is not None and piece.color == self.board.turn:
+                        self._pending_from = sq
+                        self._drag = {"kind": "branch", "from_square": sq,
+                                      "piece": piece, "cursor": self._pos(event)}
+                        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self.update()
+                return
             if self.propose_mode:
                 if sq is None:
                     return
@@ -518,7 +589,7 @@ class BoardWidget(QWidget):
                               "piece": self._armed, "cursor": self._pos(event)}
             self.update()
         elif event.button() == Qt.MouseButton.RightButton:
-            if self.propose_mode:
+            if self.mode in (BoardMode.PROPOSE, BoardMode.BRANCH):
                 self._clear_proposal()
                 self.update()
             elif self._armed is not None:
@@ -541,12 +612,15 @@ class BoardWidget(QWidget):
     def mouseReleaseEvent(self, event) -> None:
         if not self.interactive:
             return
-        if self._drag and self._drag.get("kind") == "propose":
+        if self._drag and self._drag.get("kind") in ("propose", "branch"):
             drag, self._drag = self._drag, None
             target = self._square_at(self._pos(event))
             self.unsetCursor()
             if target is not None and target != drag["from_square"]:
-                self._try_proposal(drag["from_square"], target)
+                if drag["kind"] == "branch":
+                    self._try_branch(drag["from_square"], target)
+                else:
+                    self._try_proposal(drag["from_square"], target)
                 self._clear_proposal()
             self.update()
             return
@@ -587,18 +661,30 @@ class BoardWidget(QWidget):
                 self.set_armed(None)
 
     # ------------------------------------------------------------- proposal
-    def _try_proposal(self, from_square: int, to_square: int) -> None:
-        """Emit moveProposed for a legal move; auto-append a queen for
-        pawn underpromotion-free moves. Never mutates the board."""
+    def _legal_move(self, from_square: int, to_square: int) -> chess.Move | None:
+        """The legal move from -> to, auto-queening a promotion. Never
+        mutates the board; None when there is no such move."""
         if from_square == to_square:
-            return
+            return None
         move = chess.Move(from_square, to_square)
         if self.board.is_legal(move):
-            self.moveProposed.emit(move)
-            return
+            return move
         promo = chess.Move(from_square, to_square, promotion=chess.QUEEN)
         if self.board.is_legal(promo):
-            self.moveProposed.emit(promo)
+            return promo
+        return None
+
+    def _try_proposal(self, from_square: int, to_square: int) -> None:
+        """Emit moveProposed for a legal move; never mutates the board."""
+        move = self._legal_move(from_square, to_square)
+        if move is not None:
+            self.moveProposed.emit(move)
+
+    def _try_branch(self, from_square: int, to_square: int) -> None:
+        """Emit branchMove for a legal move; never mutates the board."""
+        move = self._legal_move(from_square, to_square)
+        if move is not None:
+            self.branchMove.emit(move)
 
     def _clear_proposal(self) -> None:
         self._pending_from = None
