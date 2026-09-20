@@ -123,7 +123,7 @@ def _replay(moves) -> chess.Board:
 # ------------------------------------------------------------- what-if tree
 def _tree_checks() -> None:
     """The what-if tree's rules, with no canvas involved."""
-    # identity (§3.1): the same position reached two ways is two nodes, so
+    # identity: the same position reached two ways is two nodes, so
     # "how did I get here" stays unique — which is the only reason Δ means
     # anything; the engine cache is keyed by FEN instead, so the transposition
     # still reuses a search.
@@ -145,7 +145,7 @@ def _tree_checks() -> None:
     # an existing child comes back, it is never duplicated
     assert tree.add_child(tree.root, "g1f3") is tree.nodes["root/g1f3"]
 
-    # Δ (§5.1): the loss is measured from the side that had to choose, so the
+    # Δ: the loss is measured from the side that had to choose, so the
     # same White-relative numbers have to flip for a Black move.
     parent = gm.Node(id="p", parent=None, move=None,
                      fen="4k3/8/8/8/8/8/8/4K3 w - - 0 1")
@@ -165,7 +165,7 @@ def _tree_checks() -> None:
     parent.eval_cp = None
     assert gm.delta_cp(parent, child) is None, "an unsearched parent has none either"
 
-    # lanes (§4.2): the first child keeps the parent's row, a later sibling is
+    # lanes: the first child keeps the parent's row, a later sibling is
     # inserted below the previous sibling's whole subtree, and — the property
     # the viewport anchor depends on — an insertion never moves an ancestor.
     tree = gm.Tree(chess.STARTING_FEN)
@@ -197,7 +197,7 @@ def _tree_checks() -> None:
     assert fork.ply == 6 and all(n.ply == len(tree.path_to(n)) - 1
                                  for n in tree.nodes.values())
 
-    # a terminal position is drawn but never searched (§7)
+    # a terminal position is drawn but never searched
     mate = gm.Tree("6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1")
     assert mate.root.searchable
     mated = mate.add_child(mate.root, "a1a8")
@@ -205,7 +205,7 @@ def _tree_checks() -> None:
     assert not mated.searchable, "a mate is drawn, but there is nothing to search"
     mate.relayout()
     assert mated.ply == 1 and mated.lane == 0
-    # pruning (§5.4): killing a node takes its whole branch and nothing else,
+    # pruning: killing a node takes its whole branch and nothing else,
     # and a *candidate* lane that dies by hand puts its parent back to
     # expandable — otherwise the ＋ that laid it out could never come back
     pruned = gm.Tree(chess.STARTING_FEN)
@@ -293,7 +293,7 @@ def _whatif_checks(app) -> None:
     # arrive as new children — and each one heads its own chain
     appended = target.children[kids_before:]
     assert appended, "no candidate lanes were laid out"
-    assert appended[0].note.startswith("引擎候选 #"), appended[0].note
+    assert appended[0].note.startswith("engine candidate #"), appended[0].note
     # only the *heads* of the new lanes are remembered as spawned: the rest of
     # a chain is a variation continuation, and collapse must not fold that —
     # nor the lane the node was already continuing (candidate #1 usually *is*
@@ -343,7 +343,7 @@ def _whatif_checks(app) -> None:
     victim = tree.root.children[-1]
     assert victim.parent is tree.root and victim.children
     parent = victim.parent
-    # what the right-click actually offers, and to whom (§5.4): the ＋/−
+    # what the right-click actually offers, and to whom: the ＋/−
     # entries mirror the same toggle the chip does, and only the root has no
     # delete — the tree is anchored to it
     menu, verbs = canvas.item_for(victim).node_menu()
@@ -363,8 +363,8 @@ def _whatif_checks(app) -> None:
     wi._confirm = lambda title, text: (asked.append((title, text)), False)[1]
     wi.kill_branch(victim)
     app.processEvents()
-    assert asked and "删除" in asked[0][0], asked
-    assert "取消" in wi._status.text(), wi._status.text()
+    assert asked and "Delete" in asked[0][0], asked
+    assert "cancelled" in wi._status.text(), wi._status.text()
     assert len(tree.nodes) == total and parent.children, "a refused delete moved it"
     # a leaf has nothing behind it to lose, so it goes without a dialog
     leaf = next(n for n in tree.nodes.values()
@@ -393,11 +393,11 @@ def _whatif_checks(app) -> None:
     tree.relayout()
     assert all(n.ply == len(tree.path_to(n)) - 1 for n in tree.nodes.values())
 
-    # the root is the one node that cannot go: it is the tree's anchor (§3.2)
+    # the root is the one node that cannot go: it is the tree's anchor
     keep_nodes, keep_fen = len(tree.nodes), wi.cursor_fen()
     wi.kill_branch(tree.root)
     assert len(tree.nodes) == keep_nodes and wi.cursor_fen() == keep_fen
-    assert "根节点" in wi._status.text(), wi._status.text()
+    assert "the root" in wi._status.text(), wi._status.text()
     canvas.select_node(target)               # back where the drag block left it
 
     # ... and the wires are actually drawn: a child that inherits its parent's
@@ -433,7 +433,7 @@ def _whatif_checks(app) -> None:
     wi._board._try_branch(move.from_square, move.to_square)
     assert len(tree.nodes) == before + 1, "the drag did not branch"
     assert wi._cursor.parent is target and wi._cursor.source == "user"
-    assert wi._cursor.move == move and wi._cursor.note == "你的分支"
+    assert wi._cursor.move == move and wi._cursor.note == "your branch"
     assert not edits, "BRANCH mode must never edit the position"
     assert wi._board.fen() == wi._cursor.fen, "the board follows the new node"
     assert canvas.item_for(target).scenePos() == pos, \
@@ -491,14 +491,14 @@ def _whatif_checks(app) -> None:
     wi.copy_pgn()
     pgn = QApplication.clipboard().text()
     assert '[SetUp "1"]' in pgn and pgn.rstrip().endswith("*"), pgn[:120]
-    assert wi._status.text().startswith("已复制"), wi._status.text()
+    assert wi._status.text().startswith("copied"), wi._status.text()
 
-    # the 跟随 switch is the one control whose effect is a viewport move, so
+    # the Follow switch is the one control whose effect is a viewport move, so
     # it says what it does when it is thrown — otherwise it reads as a mystery
     wi._follow_check.setChecked(False)
-    assert "跟随关闭" in wi._status.text(), wi._status.text()
+    assert "Follow off" in wi._status.text(), wi._status.text()
     wi._follow_check.setChecked(True)
-    assert "跟随开启" in wi._status.text(), wi._status.text()
+    assert "Follow on" in wi._status.text(), wi._status.text()
 
     # leaving puts the cursor position on the board *without* dropping the
     # analysis or the tree — a display move, like replaying a line
@@ -531,7 +531,7 @@ def _whatif_checks(app) -> None:
     assert dark.pixelColor(6, 6).name() == theme.GRAPH_BG.lower()
     assert dark.pixelColor(6, 6) != light.pixelColor(6, 6)
 
-    # a real position change does drop it (§3.2)
+    # a real position change does drop it
     win._exit_whatif()
     win._board.board.set_piece_at(chess.E4, chess.Piece(chess.QUEEN, chess.WHITE))
     win._board.boardEdited.emit(win._board.fen())

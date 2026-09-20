@@ -1,5 +1,5 @@
 """What-if view: the analysed position as a move tree you can walk, branch
-and re-branch, on an infinite canvas (docs/whatif-graph-plan.md).
+and re-branch, on an infinite canvas.
 
 Three layers, top to bottom:
 
@@ -11,9 +11,9 @@ Three layers, top to bottom:
   the scene. "The viewport is never re-centred to keep a node still": an
   insertion in :meth:`Tree.relayout` cannot move the cursor node, so anchoring
   is free and the only thing that ever moves the view is *following the
-  cursor*, which has its own switch (§4.2).
+  cursor*, which has its own switch.
 * :class:`NodeItem` / :class:`GraphScene` — the pixels, including the
-  level-of-detail tiers of §4.3.
+  level-of-detail tiers.
 
 `QGraphicsItem` does not participate in the QSS, so every colour here is read
 from :mod:`chessbuddy.theme` at paint time and ``refresh_theme`` has to force
@@ -41,13 +41,13 @@ from .analysis_panel import EvalBar, _loss_label, _loss_tone
 from .board_widget import BoardMode, BoardWidget
 from .engine import EngineError
 
-#: A click on an unsearched node buys this much search (§6.3). Shallow on
+#: A click on an unsearched node buys this much search. Shallow on
 #: purpose: it lights the node up, and the depth is always shown next to it
 #: so a 600ms result is never read as a verdict.
 SEARCH_MS = 600
 MULTIPV = 3                 # one search buys the node *and* its 3 candidates
 
-#: §4.3 — what a node shows as it shrinks.
+#: What a node shows as it shrinks.
 LOD_FULL = 1.0              # move + eval + depth dot
 LOD_TEXT = 0.5              # move + eval
 LOD_SHAPE = 0.3             # colours and shape only; below: a plain block
@@ -55,13 +55,13 @@ LOD_SHAPE = 0.3             # colours and shape only; below: a plain block
 ZOOM_MIN, ZOOM_MAX = 0.15, 3.0
 #: Zoom the tree opens at. Deliberately *not* "fit": an engine PV is ~20 plies
 #: wide, and fitting that puts the nodes under the 0.5 LOD tier where their
-#: text disappears — the opening picture would be unreadable. 「适应」 is one
+#: text disappears — the opening picture would be unreadable. **Fit** is one
 #: click away for the overview.
 ENTRY_ZOOM = 1.0
 FOLLOW_MS = 200             # smooth follow, so a long jump is not a teleport
 FOLLOW_MARGIN = 40          # px of slack before "it is already on screen"
 
-#: Δ below this is the noise band of §6.4: two moves that differ by less than
+#: Δ below this is the noise band: two moves that differ by less than
 #: this are not "two different choices", they are one search's jitter.
 NOISE_CP = 10
 MATE_LEVEL = 90_000         # |Δ| above this is a mate, not centipawns
@@ -88,17 +88,17 @@ def eval_text(node: graph_model.Node) -> tuple[str, str]:
 
 
 def delta_line(node: graph_model.Node) -> tuple[str, str]:
-    """('Δ +0.03 · 与首选同价 · 引擎候选 #1', tone) for the detail bar."""
+    """('Δ +0.03 · same as best · engine candidate #1', tone) for the detail bar."""
     if node.parent is None:
-        return "Δ — · 分析的起点", "good"
+        return "Δ — · the analysed position", "good"
     delta = graph_model.delta_cp(node.parent, node)
     if delta is None:
-        return "Δ — · 父节点尚未搜索，没有比较基准", "good"
-    amount = "Δ 杀棋" if abs(delta) >= MATE_LEVEL else f"Δ {delta / 100.0:+.2f}"
+        return "Δ — · parent not searched yet, nothing to compare against", "good"
+    amount = "Δ mate" if abs(delta) >= MATE_LEVEL else f"Δ {delta / 100.0:+.2f}"
     if abs(delta) < NOISE_CP:
         # Same-price band: reusing the lowest existing tier would still say
         # "good move", which reads as a *choice* rather than as the noise it is.
-        verdict = "与首选同价（噪声带）"
+        verdict = "same as best (noise band)"
         tone = "good"
     else:
         verdict = _loss_label(delta)
@@ -138,15 +138,15 @@ class NodeItem(QGraphicsItem):
 
     The action chip hangs *below* the box — inside the bounding rect, in
     the gap the lane pitch leaves — so it never collides with the wire that
-    leaves the right edge. There is **one** chip and its glyph is the state
-    (§5.2): ``+`` while the node's candidates can be laid out, ``−`` once
+    leaves the right edge. There is **one** chip and its glyph is the state:
+    ``+`` while the node's candidates can be laid out, ``−`` once
     they are out and can be folded back. One chip rather than two because the
     two actions are mutually exclusive by construction — see
     :func:`graph_model.can_collapse` — and a permanently half-disabled pair
     of buttons under every node would read as decoration.
 
     Right click is the node's menu: expand / collapse / **delete this branch
-    and everything under it** (§5.4). Deleting is the only irreversible thing
+    and everything under it**. Deleting is the only irreversible thing
     in this view, which is why it lives behind a menu and has no key.
     """
 
@@ -241,19 +241,19 @@ class NodeItem(QGraphicsItem):
 
         Built separately from the ``exec`` so the *offer* — which verbs apply
         to this node and which are greyed out — can be read without a modal
-        menu blocking the caller (§5.4: the root has no delete).
+        menu blocking the caller (the root has no delete).
         """
         node = self.node
         menu = QMenu(self._canvas)
-        expand = menu.addAction("＋ 展开候选")
+        expand = menu.addAction("＋ Expand candidates")
         expand.setEnabled(graph_model.can_expand(node))
-        collapse = menu.addAction("− 收起候选（保留本节点）")
+        collapse = menu.addAction("− Collapse candidates (keep this node)")
         collapse.setEnabled(graph_model.can_collapse(node))
         menu.addSeparator()
-        kill = menu.addAction("✕ 删除该分支及其全部子节点")
+        kill = menu.addAction("✕ Delete this branch and every node under it")
         kill.setEnabled(node.parent is not None)
         if node.parent is None:
-            kill.setToolTip("根节点不删：树锚定在它上面")
+            kill.setToolTip("The root is not deletable: the tree is anchored to it")
         return menu, {expand: "expand", collapse: "collapse", kill: "kill"}
 
     def hoverEnterEvent(self, event) -> None:
@@ -440,7 +440,7 @@ class GraphScene(QGraphicsScene):
         A child that inherits its parent's lane gets a straight run; anything
         else leaves the parent, turns once, and comes back in — the elbow
         passes through the empty cells before the lane starts, which is the
-        "this is a fork" signal of §4.1.
+        "this is a fork" signal.
         """
         p, c = cls._box(parent), cls._box(child)
         x1, y1 = p.right(), p.center().y()
@@ -540,7 +540,7 @@ class GraphCanvas(QGraphicsView):
         """Re-read the model after it grew: items, positions, scene rect.
 
         Deliberately does **not** touch the view transform. An insertion can
-        only push lanes *below* the cursor (§4.2), so the cursor's scene
+        only push lanes *below* the cursor, so the cursor's scene
         position is already correct and nothing has to be compensated — no
         "re-centre after re-layout" step exists here to get wrong.
         """
@@ -743,7 +743,8 @@ class WhatIfView(QWidget):
         # Its own board, sharing the window's piece renderers (one SVG parse).
         self._board = BoardWidget(renderer=renderer)
         self._board.set_mode(BoardMode.BRANCH)
-        self._board.setToolTip("从走子方拖一个合法着法，就从这里长出一条新支")
+        self._board.setToolTip("Drag a legal move of the side to move to grow a "
+                               "new branch from here")
         self._board.branchMove.connect(self._on_branch_move)
         self._eval_bar = EvalBar(Qt.Orientation.Vertical)
         self._canvas = GraphCanvas(self)
@@ -771,8 +772,8 @@ class WhatIfView(QWidget):
         bar = QHBoxLayout()
         bar.setSpacing(8)
 
-        self._board_seg = QPushButton("♟ 棋盘")
-        self._graph_seg = QPushButton("⑂ 图表")
+        self._board_seg = QPushButton("♟ Board")
+        self._graph_seg = QPushButton("⑂ Graph")
         group = QButtonGroup(self)
         group.setExclusive(True)
         for button in (self._board_seg, self._graph_seg):
@@ -784,7 +785,7 @@ class WhatIfView(QWidget):
         self._board_seg.setToolTip("Back to the board view (Esc)")
         self._board_seg.clicked.connect(self._on_board_seg)
 
-        self._fit_btn = QPushButton("适应")
+        self._fit_btn = QPushButton("Fit")
         self._fit_btn.setToolTip("Zoom to fit the whole tree (0)")
         self._fit_btn.clicked.connect(lambda: self._canvas.fit())
         bar.addWidget(self._fit_btn)
@@ -794,27 +795,28 @@ class WhatIfView(QWidget):
         self._zoom_label.setFixedWidth(42)
         bar.addWidget(self._zoom_label)
 
-        self._follow_check = QCheckBox("跟随")
+        self._follow_check = QCheckBox("Follow")
         self._follow_check.setChecked(True)
         self._follow_check.setToolTip(
-            "跟随：光标移到哪个节点，视口就自动平移过去，让那个节点留在屏幕里。\n"
-            "关掉它就能自由平移、不会被拉回来。它只管「光标移动」——泳道插入时\n"
-            "图整体上下的位移是布局本身，跟这个开关无关。"
+            "Follow: when the cursor lands on a node, the viewport pans so that\n"
+            "node stays on screen. Turn it off to pan freely without being pulled\n"
+            "back. It only reacts to cursor moves — the whole graph shifting when\n"
+            "a lane is inserted is the layout, not this switch."
         )
         self._follow_check.toggled.connect(self._on_follow_toggled)
         bar.addWidget(self._follow_check)
 
-        self._dock_btn = QPushButton("收起棋盘")
+        self._dock_btn = QPushButton("Hide board")
         self._dock_btn.setToolTip("Hide the dock so the graph fills the window")
         self._dock_btn.clicked.connect(self._toggle_dock)
         bar.addWidget(self._dock_btn)
 
-        self._expand_btn = QPushButton("＋ 展开候选")
+        self._expand_btn = QPushButton("＋ Expand candidates")
         self._expand_btn.setToolTip(self._EXPAND_TIP)
         self._expand_btn.clicked.connect(self.expand_cursor)
         bar.addWidget(self._expand_btn)
 
-        self._pgn_btn = QPushButton("复制 PGN")
+        self._pgn_btn = QPushButton("Copy PGN")
         self._pgn_btn.setToolTip("Copy the path from the root to the cursor as PGN")
         self._pgn_btn.clicked.connect(self.copy_pgn)
         bar.addWidget(self._pgn_btn)
@@ -865,8 +867,9 @@ class WhatIfView(QWidget):
         self._delta_label.setWordWrap(True)
         lay.addWidget(self._delta_label)
 
-        hint = QLabel("拖子建分支 · Enter 展开/收起候选 · ↑↓ 换支 · "
-                      "右键节点可删整个分支 · Esc 回棋盘")
+        hint = QLabel("Drag a piece to branch · Enter expands / collapses candidates · "
+                      "↑↓ change line · right-click a node deletes its branch · "
+                      "Esc back to the board")
         hint.setObjectName("nodeHint")
         hint.setWordWrap(True)
         lay.addWidget(hint)
@@ -905,7 +908,7 @@ class WhatIfView(QWidget):
     # ------------------------------------------------------------ entering
     def enter(self, anchor_fen: str, lines: dict, flipped: bool = False) -> None:
         """Show the tree of ``anchor_fen``, growing it from ``lines`` on the
-        way in — the three engine lines become three lanes for free (§2)."""
+        way in — the three engine lines become three lanes for free."""
         if self._tree is None or self._tree.anchor_fen != anchor_fen:
             self._tree = graph_model.Tree(anchor_fen)
             self._plant(lines)
@@ -918,9 +921,10 @@ class WhatIfView(QWidget):
         self._canvas.select_node(self._cursor or self._tree.root)
         self._canvas.reset_zoom(self._cursor or self._tree.root)
         self._set_status(
-            f"根节点 + {len(self._tree.nodes) - 1} 个预测节点 · "
-            "点节点看该局面，Enter 展开/收起候选，拖子长出你自己的分支，"
-            "右键节点可删掉整个分支"
+            f"root + {len(self._tree.nodes) - 1} predicted nodes · "
+            "click a node to see its position, Enter expands / collapses its "
+            "candidates, drag a piece to grow your own branch, right-click a "
+            "node to delete its branch"
         )
 
     def _plant(self, lines: dict) -> None:
@@ -937,11 +941,11 @@ class WhatIfView(QWidget):
         # The root's three lanes *are* its candidates: there is nothing left
         # to unfold there, and offering it would only relist the same moves.
         # Recording the heads above is what says so (``expanded`` is derived
-        # from ``spawned``) — and it is also what lets 收起候选 fold the
+        # from ``spawned``) — and it is also what lets collapse fold the
         # opening picture back to a bare root.
 
     def on_anchor_lost(self) -> None:
-        """The analysed position changed: the tree goes with it (§3.2)."""
+        """The analysed position changed: the tree goes with it."""
         self._tree = None
         self._cursor = None
         self._searching = None
@@ -985,21 +989,23 @@ class WhatIfView(QWidget):
         self._followed = True
 
     def _on_follow_toggled(self, on: bool) -> None:
-        """「跟随」 reads as a mystery control until it has visibly done
-        something once (§5.3): switching it on pulls the cursor node back into
+        """The Follow switch reads as a mystery control until it has visibly
+        done something once: switching it on pulls the cursor node back into
         view right then — if it is off screen, which is the only case where
         following has anything to do — and says in the status bar what it is
         for. Switching it off stops an animation in flight, so the view can be
         panned without being dragged back mid-gesture.
         """
         if on:
-            self._set_status("跟随开启：切到哪个节点，视口就跟过去，让它留在屏幕里")
+            self._set_status("Follow on: the viewport pans to whichever node "
+                             "the cursor lands on, so it stays on screen")
             if self._cursor is not None:
                 self._canvas.follow_node(self._cursor)
                 self._followed = True
         else:
             self._canvas.stop_follow()
-            self._set_status("跟随关闭：视口只在你平移 / 缩放 / 按「适应」时改变")
+            self._set_status("Follow off: the viewport moves only when you pan, "
+                             "zoom, or press Fit")
 
     def _show(self, node: graph_model.Node) -> None:
         """Mirror the node onto the dock board, the eval bar and the detail
@@ -1046,21 +1052,22 @@ class WhatIfView(QWidget):
         theme.repolish(self._delta_label)
         self._sync_expand_btn(node)
 
-    _EXPAND_TIP = ("把光标节点的三个引擎候选铺成泳道（Enter）。免费：着法来自"
-                   "点亮它的那次搜索。")
-    _COLLAPSE_TIP = ("把光标节点已铺开的候选收回去（Enter）。节点本身、它所在的"
-                     "泳道、以及你手建的分支都保留。")
+    _EXPAND_TIP = ("Lay the cursor node's three engine candidates out as lanes "
+                   "(Enter). Free: the moves come from the search that lit the node.")
+    _COLLAPSE_TIP = ("Fold the cursor node's laid-out candidates back in (Enter). "
+                     "The node itself, the lane it sits on, and any branch you grew "
+                     "by hand all stay.")
 
     def _sync_expand_btn(self, node: graph_model.Node | None) -> None:
         """The button is the other half of the marker's toggle, so its label
         has to follow the state: on an expanded node there is nothing left to
         expand and the only meaningful action is to fold the lanes back in."""
         if node is not None and graph_model.can_collapse(node):
-            self._expand_btn.setText("− 收起候选")
+            self._expand_btn.setText("− Collapse candidates")
             self._expand_btn.setEnabled(True)
             self._expand_btn.setToolTip(self._COLLAPSE_TIP)
         else:
-            self._expand_btn.setText("＋ 展开候选")
+            self._expand_btn.setText("＋ Expand candidates")
             self._expand_btn.setEnabled(node is not None
                                         and graph_model.can_expand(node))
             self._expand_btn.setToolTip(self._EXPAND_TIP)
@@ -1100,7 +1107,7 @@ class WhatIfView(QWidget):
             return
         try:
             node = self._tree.add_child(self._cursor, move.uci(),
-                                        source="user", note="你的分支")
+                                        source="user", note="your branch")
         except ValueError:
             return
         self._canvas.sync()
@@ -1111,7 +1118,7 @@ class WhatIfView(QWidget):
 
         On a node whose candidates are already out there is nothing left to
         expand, and the only thing the user can mean by pressing it again is
-        「fold them back」 — so the same key does that. Without this, 展开候选
+        "fold them back" — so the same key does that. Without this, expanding
         was a one-way door: the only way back was to delete the whole tree.
         """
         node = self._cursor
@@ -1127,8 +1134,8 @@ class WhatIfView(QWidget):
         """Lay one engine candidate out as a lane — and remember it as one if
         this call is what created it.
 
-        The ``existed`` test is what makes 收起候选 the exact inverse of
-        展开候选. A node's first candidate is usually the move its lane
+        The ``existed`` test is what makes collapse the exact inverse of
+        expand. A node's first candidate is usually the move its lane
         already continues with (the PV continuation it was planted with), and
         ``add_child`` hands that *same* node back rather than a copy. Folding
         the candidates back must not truncate the line the user was reading,
@@ -1140,8 +1147,8 @@ class WhatIfView(QWidget):
         """
         existed = tree.child(node, pv[0]) is not None
         chain = tree.grow_line(node, pv, source="engine",
-                               note=f"引擎候选 #{pv_no}",
-                               chain_note=f"引擎线 #{pv_no} 的延续")
+                               note=f"engine candidate #{pv_no}",
+                               chain_note=f"continuation of engine line #{pv_no}")
         if not chain:
             return None
         head = chain[0]
@@ -1150,14 +1157,15 @@ class WhatIfView(QWidget):
         return head
 
     def expand_node(self, node: graph_model.Node) -> None:
-        """Lay the node's candidates out as lanes (§5.2).
+        """Lay the node's candidates out as lanes.
 
         Free in the common case: the MultiPV search that lit the node already
         returned its three continuations, so expanding is a redraw and not a
         search. Nodes come out unsearched — grey until you click them.
         """
         if not graph_model.can_expand(node):
-            self._set_status("这个节点还没有候选可展开（先点它，让引擎给出候选）")
+            self._set_status("this node has no candidates to expand yet "
+                             "(click it first, so the engine offers some)")
             return
         before = len(self._tree.nodes)
         for pv_no in sorted(node.candidates):
@@ -1167,8 +1175,8 @@ class WhatIfView(QWidget):
         self._canvas.sync()
         self._show(node)
         self._set_status(
-            f"铺开 {len(self._tree.nodes) - before} 个节点 · "
-            "来自同一次搜索，未新增搜索 · 再按一次 Enter 可收起"
+            f"laid out {len(self._tree.nodes) - before} nodes · "
+            "from the same search, no new search · press Enter again to fold them back"
         )
 
     def collapse_node(self, node: graph_model.Node) -> None:
@@ -1181,7 +1189,7 @@ class WhatIfView(QWidget):
         if self._tree is None:
             return
         if not graph_model.can_collapse(node):
-            self._set_status("这个节点没有已铺开的候选可收起")
+            self._set_status("this node has no laid-out candidates to fold back")
             return
         removed = self._tree.collapse(node)
         ids = {n.id for n in removed}
@@ -1189,7 +1197,8 @@ class WhatIfView(QWidget):
         self._canvas.sync()
         self._canvas.select_node(landed)
         self._set_status(
-            f"收起 {len(ids)} 个候选节点 · 节点本身保留 · 需要时再展开，不重新搜索"
+            f"folded back {len(ids)} candidate nodes · the node itself stays · "
+            "expand again whenever, with no new search"
         )
 
     def kill_branch(self, node: graph_model.Node) -> None:
@@ -1204,28 +1213,31 @@ class WhatIfView(QWidget):
         if tree is None:
             return
         if node.parent is None:
-            self._set_status("根节点不删——树锚定在它上面，删了整棵树就没有意义了")
+            self._set_status("the root is not deletable — the tree is anchored to it, "
+                             "and without it the whole tree means nothing")
             return
         doomed = tree.subtree(node)
         if len(doomed) > 1 and not self._confirm(
-                "删除分支",
-                f"删除 {graph_model.move_text(node)} 及其下 {len(doomed) - 1} 个节点？\n\n"
-                "这一步没有撤销。"):
-            self._set_status("已取消")
+                "Delete branch",
+                f"Delete {graph_model.move_text(node)} and the "
+                f"{len(doomed) - 1} nodes under it?\n\n"
+                "This cannot be undone."):
+            self._set_status("cancelled")
             return
         removed = tree.remove_subtree(node)
         ids = {n.id for n in removed}
         landed = self._forget(ids, fallback=node.parent)
         self._canvas.sync()
         self._canvas.select_node(landed)
-        bits = [f"已删除 {graph_model.move_text(node)} 及其下 {len(ids) - 1} 个节点"]
+        bits = [f"deleted {graph_model.move_text(node)} and the "
+                f"{len(ids) - 1} nodes under it"]
         if graph_model.can_expand(node.parent):
             # Say it only when it is true: the ＋ coming back is the one piece
             # of good news here, and a kill that takes the last candidate lane
             # away is exactly when the user wants to know they can grow it
             # back for free (the eval cache still holds the position).
-            bits.append("父节点已恢复可展开")
-        bits.append("这一步没有撤销")
+            bits.append("the parent can be expanded again")
+        bits.append("this cannot be undone")
         self._set_status(" · ".join(bits))
 
     def _confirm(self, title: str, text: str) -> bool:
@@ -1270,13 +1282,15 @@ class WhatIfView(QWidget):
         if cached is not None:
             # A transposition: the position was searched under another path.
             self._apply_lines(node, cached["lines"], t=cached["t"])
-            self._set_status(f"{graph_model.move_text(node)} · 缓存命中（该局面已搜过）")
+            self._set_status(f"{graph_model.move_text(node)} · cache hit "
+                             "(this position was already searched)")
             return
         if self._engine.busy:
             # Never drop the last click: cancel what is running and remember
             # this one; ``idle`` starts it as soon as the slot is really free.
             self._pending = node
-            self._set_status(f"正在结束上一次搜索 · 之后搜索 {graph_model.move_text(node)}")
+            self._set_status(f"finishing the previous search · then "
+                             f"{graph_model.move_text(node)}")
             self._engine.cancel()
             return
         self._start_search(node)
@@ -1285,10 +1299,11 @@ class WhatIfView(QWidget):
         try:
             self._engine.ensure_client()
         except EngineError as exc:
-            self._set_status(f"引擎不可用：{exc}")
+            self._set_status(f"engine unavailable: {exc}")
             return
         self._searching = node
-        self._set_status(f"搜索 {graph_model.move_text(node)} · {SEARCH_MS}ms 浅搜…")
+        self._set_status(f"searching {graph_model.move_text(node)} · "
+                         f"{SEARCH_MS}ms shallow search…")
 
         def run(stop, info_sig):
             return self._engine.client.analyze(
@@ -1307,7 +1322,8 @@ class WhatIfView(QWidget):
         depth = info.get("depth")
         if depth:
             self._set_status(
-                f"搜索 {graph_model.move_text(node)} · d{depth} · {SEARCH_MS}ms 浅搜…")
+                f"searching {graph_model.move_text(node)} · d{depth} · "
+                f"{SEARCH_MS}ms shallow search…")
 
     def _on_search_done(self, result: dict) -> None:
         node, self._searching = self._searching, None
@@ -1315,11 +1331,11 @@ class WhatIfView(QWidget):
             return
         lines = result.get("lines") or {}
         if lines and self._apply_lines(node, lines):
-            bits = [f"节点 {graph_model.move_text(node)}"]
+            bits = [f"node {graph_model.move_text(node)}"]
             if node.note:
                 bits.append(node.note)
             bits.append(f"d{node.depth or '?'}")
-            bits.append(f"{SEARCH_MS}ms 浅搜")
+            bits.append(f"{SEARCH_MS}ms shallow search")
             self._set_status(" · ".join(bits))
         else:
             # No result — almost always because this search was superseded and
@@ -1327,11 +1343,12 @@ class WhatIfView(QWidget):
             # *unsearched* on purpose: marking it would block the retry that
             # the remembered last click is about to make, and would leave a
             # node the user did ask about permanently grey.
-            self._set_status(f"{graph_model.move_text(node)} · 引擎没有返回评估（可再点一次）")
+            self._set_status(f"{graph_model.move_text(node)} · the engine "
+                             "returned no eval (click it again to retry)")
 
     def _on_search_failed(self, message: str) -> None:
         node, self._searching = self._searching, None
-        self._set_status(f"搜索失败：{message}")
+        self._set_status(f"search failed: {message}")
         if node is not None:
             node.searched_at = None                 # a later click may retry
 
@@ -1408,7 +1425,8 @@ class WhatIfView(QWidget):
             if step.move is not None:
                 node = node.add_variation(step.move)
         QApplication.clipboard().setText(str(game).strip())
-        self._set_status(f"已复制根到光标的 {len(path) - 1} 手 PGN")
+        self._set_status(f"copied the {len(path) - 1} moves from the root to "
+                         "the cursor as PGN")
 
     def _on_board_seg(self) -> None:
         if self._active:
@@ -1420,7 +1438,7 @@ class WhatIfView(QWidget):
         # apart from the dock having been collapsed.
         show = self._dock.isHidden()
         self._dock.setVisible(show)
-        self._dock_btn.setText("收起棋盘" if show else "展开棋盘")
+        self._dock_btn.setText("Hide board" if show else "Show board")
 
     def _on_zoom(self, factor: float) -> None:
         self._zoom_label.setText(f"{factor * 100:.0f}%")

@@ -1,10 +1,10 @@
 """What-if tree model: the nodes, the lane layout, and the arithmetic behind
-a node's Δ (see docs/whatif-graph-plan.md §3–§5).
+a node's Δ.
 
 Deliberately Qt-free — the geometry is plain numbers and the tree rules are
 reasoned about (and tested) without a canvas.
 
-Two identity rules that must stay separate (§3.1):
+Two identity rules that must stay separate:
 
 * a node is located in the tree by ``(parent.id, move.uci())``, so the same
   position reached two ways is **two nodes** (this is a tree, not a graph).
@@ -46,13 +46,13 @@ def terminal(board: chess.Board) -> bool:
 @dataclass(eq=False)
 class Node:
     """One move in the tree. It exists (its board can be shown) even when it
-    has never been searched — that is the grey/lit distinction of §7.
+    has never been searched — that is the grey/lit distinction.
 
     ``eq=False`` on purpose: nodes are mutable objects in a tree and are
     identified by their ``id``. A generated ``__eq__`` would compare the
     ``parent`` / ``children`` cycles field by field for any two distinct
     nodes, which is both wrong (two nodes at the same FEN are different
-    nodes, §3.1) and potentially explosive.
+    nodes) and potentially explosive.
     """
 
     id: str
@@ -61,7 +61,7 @@ class Node:
     fen: str
     san: str = ""
     source: str = "engine"        # "engine" | "user" | "game"
-    note: str = ""                # human label, e.g. "引擎候选 #1"
+    note: str = ""                # human label, e.g. "engine candidate #1"
     children: list["Node"] = field(default_factory=list)
 
     eval_cp: int | None = None    # White-relative centipawns
@@ -75,7 +75,7 @@ class Node:
     #: ids of the children a *candidate* search laid out as lanes — never the
     #: continuation of a PV and never a branch grown by hand. This is the
     #: bookkeeping that makes both halves of the expand toggle possible:
-    #: ``expanded`` is derived from it, and 收起候选 folds exactly these back.
+    #: ``expanded`` is derived from it, and collapse folds exactly these back.
     spawned: list[str] = field(default_factory=list)
     ply: int = 0                  # layout: distance from the root
     lane: int = 0                 # layout: which row
@@ -110,7 +110,7 @@ class Tree:
     """Everything one what-if session is: nodes, layout, engine cache.
 
     The tree is anchored to one analysed position. ``anchor_fen`` changing
-    means the whole tree is dropped (§3.2) — deliberately, so a branch can
+    means the whole tree is dropped — deliberately, so a branch can
     never end up hanging off an unrelated position.
     """
 
@@ -118,11 +118,11 @@ class Tree:
         board = chess.Board(anchor_fen)
         self.anchor_fen = anchor_fen
         self.root = Node(id="root", parent=None, move=None, fen=anchor_fen,
-                         note="分析的起点", searchable=not terminal(board))
+                         note="starting position", searchable=not terminal(board))
         self.nodes: dict[str, Node] = {self.root.id: self.root}
         #: position key (see :func:`cache_key`) -> {"lines", "depth", "t"}.
         #: Keyed by position, never by node: that is what makes a transposition
-        #: free, and it cannot affect the tree's shape (§3.1).
+        #: free, and it cannot affect the tree's shape.
         self.eval_cache: dict[str, dict] = {}
 
     # ------------------------------------------------------------- growth
@@ -157,8 +157,8 @@ class Tree:
         """Lay a whole engine line out as a chain under ``parent``.
 
         A PV is one straight run of moves, so it becomes one lane: every node
-        after the first is an only child and therefore inherits the lane
-        (§4.2). Nodes come out unsearched — grey, no numbers (§7).
+        after the first is an only child and therefore inherits the lane.
+        Nodes come out unsearched — grey, no numbers.
 
         ``note`` labels the head of the chain (the move that was actually
         chosen); ``chain_note`` labels its continuation, so the detail bar can
@@ -201,13 +201,13 @@ class Tree:
     def remove_subtree(self, node: Node) -> list[Node]:
         """Kill ``node`` and every node under it; returns what was removed.
 
-        The root is not removable — the tree is anchored to a position
-        (§3.2), so a tree with no root has nothing left to mean — and this
+        The root is not removable — the tree is anchored to a position, so a
+        tree with no root has nothing left to mean — and this
         returns ``[]`` rather than raising, because the alternative is a
         caller-side check in every direction.
 
         The ``eval_cache`` entries are deliberately left alone: they are
-        keyed by position, not by node (§3.1), so a branch that is killed
+        keyed by position, not by node, so a branch that is killed
         and grown again costs no search.
 
         Only the *parent's* ``spawned`` needs filtering. Descendants of the
@@ -229,7 +229,7 @@ class Tree:
     def collapse(self, node: Node) -> list[Node]:
         """Fold a node's candidate lanes back in — an expand, undone.
 
-        Exactly the children a candidate search laid out go (§5.2). A branch
+        Exactly the children a candidate search laid out go. A branch
         the user grew by hand is not ``spawned`` and survives, because the
         picture drawn by hand is not the engine's to fold; so is a PV
         continuation, which is not a candidate either.
@@ -244,7 +244,7 @@ class Tree:
 
     # ----------------------------------------------------------- geometry
     def relayout(self) -> None:
-        """Reassign ``ply`` / ``lane`` for the whole tree (§4.2).
+        """Reassign ``ply`` / ``lane`` for the whole tree.
 
         Two rules, and nothing else:
 
@@ -337,8 +337,8 @@ def delta_cp(parent: Node | None, node: Node) -> int | None:
     for Black. ``None`` while either end is unsearched: a Δ needs a baseline.
 
     A negative result is possible (the move "beat" the parent's best line);
-    it is search noise between two positions, and the 10cp noise band of §6.4
-    is exactly what keeps it from being read as a real difference.
+    it is search noise between two positions, and the 10cp noise band is
+    exactly what keeps it from being read as a real difference.
     """
     if parent is None or parent.eval_cp is None or node.eval_cp is None:
         return None
@@ -354,7 +354,7 @@ def stm_of(node: Node) -> bool:
 def cache_key(fen: str) -> str:
     """The engine-cache key for a position: a FEN without its move counters.
 
-    §3.1 keys the cache by position rather than by node so a transposition
+    The cache is keyed by position rather than by node so a transposition
     reuses a search instead of paying for it twice — and two paths to the same
     position almost never agree on the halfmove clock, so the counters have to
     go or the cache would only ever match a node against itself.
@@ -365,7 +365,7 @@ def cache_key(fen: str) -> str:
 def move_text(node: Node) -> str:
     """'4… Nf6' — the move that reached ``node``, with its number prefix."""
     if node.parent is None:
-        return "起始局面"
+        return "starting position"
     board = chess.Board(node.parent.fen)
     prefix = (f"{board.fullmove_number}. " if board.turn == chess.WHITE
               else f"{board.fullmove_number}… ")
@@ -376,7 +376,7 @@ def can_expand(node: Node) -> bool:
     """Is there a free expansion waiting on this node?
 
     Only a searched node has candidates (one MultiPV search buys both the
-    node's own eval *and* its three continuations — §6.1), and ``expanded``
+    node's own eval *and* its three continuations), and ``expanded``
     keeps a second click from re-laying the same moves out.
 
     Note that a node can have children *and* still be expandable: its children

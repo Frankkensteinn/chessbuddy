@@ -6,7 +6,7 @@ board).
 
 After an analysis the window also offers the **What-if** view: the same
 position, but as an expandable move tree on an infinite canvas (see
-``graph_view`` and ``docs/whatif-graph-plan.md``). The two views are pages of
+``graph_view``). The two views are pages of
 one ``QStackedWidget`` and share a single cursor position, so leaving the graph
 puts the board on the node you were looking at — and, because that is a
 *display* move like replaying a line, the analysis and the tree both survive,
@@ -538,7 +538,7 @@ class MainWindow(QMainWindow):
         This only *shows* another position — exactly like replaying a line —
         so the analysis and the tree both survive and the view can be entered
         again where you left it. A tree is only dropped when the analysed
-        position itself changes (§3.2).
+        position itself changes.
         """
         if not self._whatif.is_active():
             return

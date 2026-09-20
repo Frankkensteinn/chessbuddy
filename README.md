@@ -55,7 +55,7 @@ Once **Analyze** has finished, **What-if** turns the analysed position into a mo
 - **Leaving keeps everything.** Moving the board to the cursor is a display move, exactly like replaying a line: the analysis and the tree both survive, so What-if resumes where you were. Editing or re-fetching the position *does* drop the tree, because the tree belongs to the position it grew from.
 - **Shallow is labelled as shallow.** Every number carries its depth, and a Δ under 10 cp is reported as the noise band rather than as a different choice: a 600 ms search is a starting point, not a verdict.
 
-Layout rules, the Δ arithmetic, the engine budget and the deliberate non-goals are specified in `docs/whatif-graph-plan.md`; `scripts/smoke_test.py` covers the model's invariants (node identity, lane insertion, Δ) and the view end to end (entry, expand, branch, re-entry, both themes).
+`scripts/smoke_test.py` covers the model's invariants (node identity, lane insertion, Δ) and the view end to end (entry, expand, branch, re-entry, both themes).
 
 ---
 

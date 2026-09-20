@@ -1,5 +1,5 @@
 """One engine, one job at a time — shared by the analysis panel and the
-what-if graph (docs/whatif-graph-plan.md §6.2).
+what-if graph.
 
 ``StockfishClient`` is deliberately single-consumer: it owns one subprocess
 and one output queue, so two overlapping ``analyze`` calls would interleave
